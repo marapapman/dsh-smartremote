@@ -32,6 +32,13 @@ Requirements: DSH Desktop, an OpenSSH client with non-interactive key auth
 (`BatchMode=yes`; use ssh-agent for passphrase keys), and Node.js + `dsh` on the server
 (auto-installed on first connect if missing).
 
+Install (see [安装](#安装) for all three ways):
+
+1. `git clone https://github.com/marapapman/dsh-smartremote.git`
+2. In DSH: sidebar **Plugins** → **Add plugin** → paste the absolute path of the clone
+   (or run `dsh plugin add /path/to/dsh-smartremote` from a terminal).
+3. Open **Settings → Remote Hosts**, add a server, then click its sidebar icon.
+
 </details>
 
 ## 它能做什么
@@ -50,6 +57,94 @@ Requirements: DSH Desktop, an OpenSSH client with non-interactive key auth
 - **SSH 连接已运行的 dsh**：远端已经手动跑着 dsh web 时，只做端口转发，填一下远端
   打印的访问令牌即可。
 - **直接 URL**：远端已经有反向代理/公网地址时，直接打开完整 URL。
+
+## 安装
+
+本仓库就是一个完整的 DSH bundle（Host 插件 + Client 面板，含 `dsh.bundle.patch`），
+不需要发布到 npm。先克隆到本机任意目录：
+
+```sh
+git clone https://github.com/marapapman/dsh-smartremote.git
+```
+
+> 桌面版、Web 版都内置了「插件」页和 `dsh plugin` 命令；装完通常立即生效，
+> 如果界面提示「请重启 DSH 使更改生效」，按提示重启即可。
+
+### 方式一：应用内安装（推荐，不用改配置文件）
+
+1. 打开 DSH 应用，在左侧栏点 **插件**；
+2. 点 **添加插件**（主按钮），或点它右侧箭头 → **安装第三方插件**；
+   ——「添加插件」对话框的说明是「输入插件的包名、GitHub 仓库地址或本地目录路径」，
+   支持 npm 包、Git 仓库、压缩包和**本地目录**；
+3. 在 **包名或地址** 输入框里填下面任意一种，然后点 **安装**：
+   - 本地目录绝对路径（推荐，仓库已克隆到本机）：
+     - Windows：`C:\Users\me\src\dsh-smartremote`
+     - macOS / Linux：`/Users/me/src/dsh-smartremote`
+   - Git 地址：`git+https://github.com/marapapman/dsh-smartremote.git`
+   - （若仓库不可匿名访问，请用本地目录方式，或换成你能访问的地址）
+4. 等待安装任务跑完（对话框里能看到 pnpm 输出）；成功后该插件出现在
+   **已安装插件** 列表里，并已加入 profile 的 `dsh.profile.bundles`。
+5. 到 **设置 → 远程主机** 添加第一台服务器，保存后左侧栏出现以主机名命名的图标。
+
+升级与卸载都在同一页面：插件详情里点 **卸载**；本插件不是 npm 包，
+升级方式是「卸载后重新安装」（或直接 `git pull` 后重装）。
+
+### 方式二：命令行
+
+DSH 自带 `dsh plugin`，它把参数转发给 profile 目录里的 pnpm，并同步组合包选择：
+
+```sh
+# 本地目录（路径随便放在哪，指向仓库根目录）
+dsh plugin add /Users/me/src/dsh-smartremote
+
+# 或者 Git 仓库
+dsh plugin add git+https://github.com/marapapman/dsh-smartremote.git
+
+# 指定 profile（桌面版默认 profile 是 desktop）
+dsh plugin --profile desktop add /Users/me/src/dsh-smartremote
+```
+
+装好后启动/重启 DSH 即可。卸载：`dsh plugin remove dsh-smartremote`。
+
+> Windows 桌面版若 `dsh` 不在 PATH，可用应用自带的命令行入口：
+> `<DSH 安装目录>\resources\runtime\cli\bin\dsh.cmd`。
+
+### 方式三：手动编辑 profile（改代码时用这个）
+
+开发调试时让 profile 直接**链接**源码目录，改完代码重载即可，不必反复安装：
+
+1. 把仓库加入 profile 依赖（以 `desktop` profile 为例，
+   `~/.dsh/profiles/desktop/package.json`）：
+
+   ```json
+   {
+     "dependencies": {
+       "dsh-smartremote": "link:/absolute/path/to/dsh-smartremote"
+     },
+     "dsh": {
+       "profile": {
+         "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "dsh-smartremote"]
+       }
+     }
+   }
+   ```
+
+2. 在 profile 目录里安装依赖（生成 workspace 链接）：
+
+   ```sh
+   cd ~/.dsh/profiles/desktop
+   pnpm install
+   ```
+
+3. 重启 DSH Desktop（或用插件页的开关触发一次重新组合）。
+
+安装后左侧栏会出现已配置主机的图标（首次没有主机时，先在 **设置 → 远程主机**
+添加一台）。
+
+- Bundle id：`dsh-smartremote`
+- Host 插件行：`remote-desktop`（`inject: webServer, connection`）
+- Client 面板：`sidebar.panellist` id `remote-desktop` + `main` key `remote-desktop`
+- 状态文件：`~/.dsh/remote-desktop.json`
 
 ## 使用前提
 
@@ -142,48 +237,6 @@ Strict cookie，远端页面会显示 “dsh web authentication required”。
 - 远端和本地 dsh 版本不一致时，界面以远端版本为准，个别新面板可能缺失。
 - 首次连接会 `accept-new` 记录服务器主机密钥（写入系统 known_hosts）。
 
-## 安装
-
-这是一个 DSH bundle（Host 插件 + Client 面板），作为本地目录链接进某个 profile 即可，
-不需要发布到 npm：
-
-```sh
-git clone https://github.com/marapapman/dsh-smartremote.git
-```
-
-1. 把它加入 profile 的依赖（以 `desktop` profile 为例，
-   `~/.dsh/profiles/desktop/package.json`）：
-
-   ```json
-   {
-     "dependencies": {
-       "dsh-smartremote": "link:/absolute/path/to/dsh-smartremote"
-     },
-     "dsh": {
-       "profile": {
-         "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "dsh-smartremote"]
-       }
-     }
-   }
-   ```
-
-2. 在 profile 目录里安装依赖（生成 workspace 链接）：
-
-   ```sh
-   cd ~/.dsh/profiles/desktop
-   pnpm install
-   ```
-
-3. 重启 DSH Desktop（或让插件管理器重新加载 profile）。
-
-安装后左侧栏会出现已配置主机的图标（首次没有主机时，先在 **设置 → 远程主机**
-添加一台）。升级只需 `git pull` 后重启应用。
-
-- Bundle id：`dsh-smartremote`
-- Host 插件行：`remote-desktop`（`inject: webServer, connection`）
-- Client 面板：`sidebar.panellist` id `remote-desktop` + `main` key `remote-desktop`
-- 状态文件：`~/.dsh/remote-desktop.json`
-
 ## 开发与自测
 
 仓库里就是完整源码（Host 半 `index.js`、Client 半 `client.js`，`SPEC.md` 为设计与
@@ -203,10 +256,6 @@ cp index.js /tmp/index.mjs && node --check /tmp/index.mjs
 
 SSH 隧道与远端界面需要真实服务器联调：添加一台能免密 SSH 登录、且已安装 `dsh` 的
 服务器，先点「测试」，再点「连接」。
-
-## 许可
-
-[MIT](LICENSE)
 
 ## 排障
 
@@ -239,3 +288,7 @@ SSH 隧道与远端界面需要真实服务器联调：添加一台能免密 SSH
 - `Permission denied`：确认公钥已装到服务器 `~/.ssh/authorized_keys`，或私钥路径正确。
 - `command not found`：在「启动命令」里用 `dsh` 的绝对路径。
 - 远端端口被占用：换一个远端端口（同时改启动命令里的 `--port`）。
+
+## 许可
+
+[MIT](LICENSE)
