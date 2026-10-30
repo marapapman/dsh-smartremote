@@ -1,0 +1,49 @@
+{
+  "name": "dsh-smartremote",
+  "version": "0.9.11",
+  "description": "DSH Desktop plugin: operate a dsh instance running on a remote server over SSH, with a toolbar-less takeover view in the desktop app.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/marapapman/dsh-smartremote.git"
+  },
+  "homepage": "https://github.com/marapapman/dsh-smartremote",
+  "bugs": {
+    "url": "https://github.com/marapapman/dsh-smartremote/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "deepseek",
+    "ssh",
+    "remote",
+    "tunnel",
+    "plugin"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "SPEC.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}

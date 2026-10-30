@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Remote Desktop",
+    "description": "Connect to dsh running on a remote server over SSH and operate it inside the desktop app."
+  }
+}

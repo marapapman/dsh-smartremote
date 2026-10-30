@@ -1,0 +1,4 @@
+# Installs the Remote Desktop bundle into the current profile.
+- insert:
+    - id: remote-desktop
+      name: 'dsh-smartremote'
