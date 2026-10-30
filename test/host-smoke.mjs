@@ -269,6 +269,28 @@ async function main() {
       host: { id, name: 'Local UI', mode: 'url', url: 'http://127.0.0.1:9/', installCommand: 'ignored' },
     })
     check('installCommand cleared for non-launch mode', urlHostInstall.payload?.host?.installCommand === '')
+
+    // 4c. 保持远端运行（keepRemoteRunning）：默认 false / launch 生效 / 非 launch 强制 false / 持久化
+    const keepDefault = await call(base, 'POST', `${prefix}/hosts`, {
+      host: { name: 'Keep Off', mode: 'launch', host: 'example.com' },
+    })
+    check('keepRemoteRunning defaults false', keepDefault.payload?.host?.keepRemoteRunning === false)
+    const keepId = keepDefault.payload?.host?.id
+    const keepOn = await call(base, 'POST', `${prefix}/hosts`, {
+      host: { id: keepId, name: 'Keep On', mode: 'launch', host: 'example.com', keepRemoteRunning: true },
+    })
+    check('keepRemoteRunning enabled on launch host', keepOn.payload?.host?.keepRemoteRunning === true)
+    const keepStore = JSON.parse(await readFile(join(home, 'remote-desktop.json'), 'utf8'))
+    check(
+      'keepRemoteRunning persisted',
+      keepStore.hosts.find((host) => host.id === keepId)?.keepRemoteRunning === true,
+    )
+    const keeplessAttach = await call(base, 'POST', `${prefix}/hosts`, {
+      host: { name: 'Keep Attach', mode: 'attach', host: 'example.com', keepRemoteRunning: true },
+    })
+    check('keepRemoteRunning cleared for non-launch mode', keeplessAttach.payload?.host?.keepRemoteRunning === false)
+    await call(base, 'POST', `${prefix}/hosts/delete`, { id: keepId })
+    await call(base, 'POST', `${prefix}/hosts/delete`, { id: keeplessAttach.payload?.host?.id })
     await call(base, 'POST', `${prefix}/hosts/delete`, { id: launchId })
 
     // 5. 连接状态机（url 模式立即 connected）
@@ -315,6 +337,12 @@ async function main() {
     check('open-url rejects javascript: → 400', badScheme.status === 400)
     const withCredentials = await call(base, 'POST', `${prefix}/open-url`, { url: 'https://user:pass@example.com/x' })
     check('open-url rejects credentials → 400', withCredentials.status === 400)
+
+    // 9c. 重启远端：url 模式没有远端进程 → 400；未知 id → 404
+    const restartUrlMode = await call(base, 'POST', `${prefix}/restart`, { id })
+    check('restart url mode → 400', restartUrlMode.status === 400)
+    const restartMissing = await call(base, 'POST', `${prefix}/restart`, { id: 'missing' })
+    check('restart unknown id → 404', restartMissing.status === 404)
 
     // 10. 删除
     const removed = await call(base, 'POST', `${prefix}/hosts/delete`, { id })

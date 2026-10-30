@@ -328,6 +328,7 @@ function restoreHost(record) {
     remotePort: input.remotePort,
     launchCommand: input.launchCommand,
     installCommand: input.installCommand,
+    keepRemoteRunning: input.keepRemoteRunning === true,
     token: input.token,
     url: input.url,
     updatedAt,
@@ -472,10 +473,26 @@ function validateHostInput(rawHost) {
     mode === 'launch' ? normalizeText(rawHost.launchCommand, 4096) || DEFAULT_LAUNCH_COMMAND : ''
   const installCommand =
     mode === 'launch' ? normalizeText(rawHost.installCommand, 4096) || DEFAULT_INSTALL_COMMAND : ''
+  // 保持远端运行只对 launch 模式有意义：远端 dsh 以 setsid 后台启动、断开时不清理，
+  // 下次连接复用同一个进程（任务不中断）。
+  const keepRemoteRunning = mode === 'launch' ? rawHost.keepRemoteRunning === true : false
   let name = normalizeText(rawHost.name, 80)
   if (!name) name = defaultHostName(mode, host, url)
 
-  return { name, mode, host, port, user, identityFile, remotePort, launchCommand, installCommand, token, url }
+  return {
+    name,
+    mode,
+    host,
+    port,
+    user,
+    identityFile,
+    remotePort,
+    launchCommand,
+    installCommand,
+    keepRemoteRunning,
+    token,
+    url,
+  }
 }
 
 /** 构造 HostView（字段名与顺序与 SPEC 一致）。 */
@@ -491,6 +508,7 @@ function makeHostView(input, existingId) {
     remotePort: input.remotePort,
     launchCommand: input.launchCommand,
     installCommand: input.installCommand,
+    keepRemoteRunning: input.keepRemoteRunning === true,
     token: input.token,
     url: input.url,
     updatedAt: new Date().toISOString(),
@@ -598,19 +616,25 @@ function sshTarget(host) {
   return host.user ? `${host.user}@${host.host}` : host.host
 }
 
+/** 保持远端运行只对 launch 模式生效：远端 dsh 独立于 ssh 会话常驻。 */
+function isDetachedLaunch(host) {
+  return Boolean(host) && host.mode === 'launch' && host.keepRemoteRunning === true
+}
+
 /**
  * 建立转发连接的 argv。
  * launch：最后一个参数是替换过 {port} 的启动命令（作为单个 argv 交给 ssh，由 ssh
  * 在远端按 shell 解释）；attach：加 -N，不执行远端命令。
+ * 保持远端运行的 launch 等同于 attach：远端进程已由准备步骤常驻启动，这里只建隧道。
  * remotePort 允许与配置不同（启动前探测到占用时会自动换端口）。
  */
 function buildSshArgs(host, localPort, remotePort = host.remotePort) {
   const args = [...SSH_CONNECT_OPTIONS, '-p', String(host.port)]
   if (host.identityFile) args.push('-i', expandHomePath(host.identityFile))
   args.push('-L', `127.0.0.1:${localPort}:127.0.0.1:${remotePort}`)
-  if (host.mode === 'attach') args.push('-N')
+  if (host.mode === 'attach' || isDetachedLaunch(host)) args.push('-N')
   args.push(sshTarget(host))
-  if (host.mode === 'launch') {
+  if (host.mode === 'launch' && !isDetachedLaunch(host)) {
     args.push(host.launchCommand.replaceAll('{port}', String(remotePort)))
   }
   return args
@@ -738,6 +762,116 @@ function buildRemotePortCleanupScript(port) {
 }
 
 /**
+ * 远端重启脚本：结束端口上的 dsh，并等端口释放（最多约 6 秒）。
+ * 输出 `PORT=FREE` 或 `PORT=BUSY`，供「重启远端」在重建连接前确认。
+ */
+function buildRemoteRestartScript(port) {
+  return [
+    `PORT=${port}`,
+    'kill_dsh() {',
+    '  if command -v fuser >/dev/null 2>&1; then',
+    '    for pid in $(fuser -n tcp "$PORT" 2>/dev/null); do',
+    '      if tr "\\0" " " < "/proc/$pid/cmdline" 2>/dev/null | grep -q dsh; then',
+    '        kill "$pid" 2>/dev/null',
+    '      fi',
+    '    done',
+    '  fi',
+    '}',
+    'check_port() {',
+    '  if command -v ss >/dev/null 2>&1; then',
+    '    ss -ltn 2>/dev/null | grep -qE "[:.]$PORT[[:space:]]"',
+    '  else',
+    '    netstat -ltn 2>/dev/null | grep -qE "[:.]$PORT[[:space:]]"',
+    '  fi',
+    '}',
+    'kill_dsh',
+    'i=0',
+    'while [ "$i" -lt 12 ]; do',
+    '  if ! check_port; then echo "PORT=FREE"; exit 0; fi',
+    '  if [ "$i" -eq 3 ]; then kill_dsh; fi',
+    '  sleep 0.5',
+    '  i=$((i + 1))',
+    'done',
+    'echo "PORT=BUSY"',
+  ].join('\n')
+}
+
+/** 把任意字符串包成 POSIX shell 单引号字面量。 */
+function shellSingleQuote(text) {
+  return `'${String(text).replaceAll("'", "'\\''")}'`
+}
+
+/** 保持远端运行时，远端 dsh 的输出与访问令牌记录在这里（跨 ssh 会话保留）。 */
+const REMOTE_LAUNCH_LOG = '~/.dsh/remote-desktop-web.log'
+const DETACHED_WAIT_SECONDS = 40
+
+/**
+ * 保持远端运行（keep-alive）的远端准备脚本：
+ * - 端口上已有一个 dsh → 从日志里取回它的令牌，直接复用（任务不中断）；
+ * - 端口空闲 → 用 setsid/nohup 把 dsh 脱离 ssh 会话常驻启动，等日志出现令牌后返回；
+ * - 端口被别的进程占用 → 明确失败，让用户换端口或改用 attach 模式。
+ * 只读取「选定端口 + 本次新增日志」的令牌，避免拿到上一个进程的旧令牌。
+ */
+function buildRemoteDetachedLaunchScript(port, launchCommand) {
+  const command = shellSingleQuote(launchCommand)
+  return [
+    `PORT=${port}`,
+    'LOG="$HOME/.dsh/remote-desktop-web.log"',
+    'mkdir -p "$HOME/.dsh" 2>/dev/null || true',
+    'touch "$LOG" 2>/dev/null || true',
+    'check_port() {',
+    '  if command -v ss >/dev/null 2>&1; then',
+    '    ss -ltn 2>/dev/null | grep -qE "[:.]$1[[:space:]]"',
+    '  else',
+    '    netstat -ltn 2>/dev/null | grep -qE "[:.]$1[[:space:]]"',
+    '  fi',
+    '}',
+    'read_token() {',
+    '  tail -n +"$1" "$LOG" 2>/dev/null | grep -o ":$PORT/?token=[^ ]*" | tail -n 1 | sed "s#.*token=##"',
+    '}',
+    'if check_port "$PORT"; then',
+    '  PID=$(fuser -n tcp "$PORT" 2>/dev/null | tr -d " ")',
+    '  if [ -n "$PID" ] && tr "\\0" " " < "/proc/$PID/cmdline" 2>/dev/null | grep -q dsh; then',
+    '    TOKEN=$(read_token 1)',
+    '    if [ -n "$TOKEN" ]; then',
+    '      echo "REUSE=1"',
+    '      echo "PORT=$PORT"',
+    '      echo "TOKEN=$TOKEN"',
+    '      exit 0',
+    '    fi',
+    '    echo "FAILED=reuse-no-token"',
+    '    exit 0',
+    '  fi',
+    '  echo "FAILED=port-busy"',
+    '  exit 0',
+    'fi',
+    'if [ -f "$LOG" ] && [ "$(wc -c < "$LOG" 2>/dev/null || echo 0)" -gt 2000000 ]; then mv "$LOG" "$LOG.1"; fi',
+    'START=$(wc -l < "$LOG" 2>/dev/null || echo 0)',
+    'cd "$HOME" 2>/dev/null || true',
+    'if command -v setsid >/dev/null 2>&1; then',
+    `  setsid nohup sh -c ${command} >> "$LOG" 2>&1 < /dev/null &`,
+    'else',
+    `  nohup sh -c ${command} >> "$LOG" 2>&1 < /dev/null &`,
+    'fi',
+    'echo "PID:$!"',
+    'i=0',
+    `while [ "$i" -lt ${DETACHED_WAIT_SECONDS} ]; do`,
+    '  TOKEN=$(read_token $((START + 1)))',
+    '  if [ -n "$TOKEN" ]; then',
+    '    echo "REUSE=0"',
+    '    echo "PORT=$PORT"',
+    '    echo "TOKEN=$TOKEN"',
+    '    exit 0',
+    '  fi',
+    '  sleep 1',
+    '  i=$((i + 1))',
+    'done',
+    'echo "FAILED=no-token"',
+    'tail -n 25 "$LOG" 2>/dev/null',
+  ].join('\n')
+}
+
+/**
  * 启动前准备远端端口：如果配置端口被上一次残留的 dsh 占用，尽量回收；否则向后找空闲端口。
  * 成功后把最终端口写到 conn.remotePort。
  */
@@ -771,25 +905,89 @@ async function prepareRemotePort(conn, sshPath) {
   return true
 }
 
+/**
+ * 保持远端运行（keep-alive）的 launch 准备：
+ * 远端 dsh 以 setsid 脱离 ssh 会话常驻，令牌写入远端日志；再次连接时复用同一进程，
+ * 因此断开/退出本机不会中断远端正在执行的任务。
+ * 成功后设置 conn.remotePort 与 conn.token。
+ */
+async function prepareDetachedRemoteDsh(conn, sshPath) {
+  const port = conn.host.remotePort
+  const launchCommand = (conn.host.launchCommand || DEFAULT_LAUNCH_COMMAND).replaceAll('{port}', String(port))
+  const script = buildRemoteDetachedLaunchScript(port, launchCommand)
+  const step = await runRemoteStep(
+    conn,
+    sshPath,
+    buildRemoteCommandArgs(conn.host, encodeRemoteScript(script)),
+    SETUP_PROBE_TIMEOUT_MS * 3,
+  )
+  if (conn.status !== 'connecting') return false
+
+  const reuse = /REUSE=1/.test(step.stdout)
+  const tokenMatch = /TOKEN=([^\s]+)/.exec(step.stdout)
+  const failed = /FAILED=([a-z-]+)/.exec(step.stdout)
+  if (tokenMatch !== null && failed === null) {
+    conn.remotePort = port
+    conn.token = tokenMatch[1]
+    appendLogLine(
+      conn,
+      reuse
+        ? `[setup] 复用远端已运行的 dsh（端口 ${port}），此前任务继续运行`
+        : `[setup] 远端 dsh 已在后台常驻启动（端口 ${port}，日志 ${REMOTE_LAUNCH_LOG}）`,
+    )
+    return true
+  }
+
+  const code = failed === null ? 'unknown' : failed[1]
+  const reason =
+    code === 'port-busy'
+      ? `远端端口 ${port} 被其他进程占用。请换一个远端端口，或改用「SSH 连接已运行的 dsh」模式。`
+      : code === 'reuse-no-token'
+        ? `远端端口 ${port} 上已有一个 dsh，但 ${REMOTE_LAUNCH_LOG} 里没有它的访问令牌。请在远端结束该进程后重试，或改用 attach 模式并手动填令牌。`
+        : `远端 dsh 在后台启动后没有输出访问令牌。请检查「启动命令」，或查看远端日志 ${REMOTE_LAUNCH_LOG}。`
+  // 仅当本次确实新起了一个进程时才清理，复用的进程绝不杀。
+  if (!reuse) killRemoteDshOnPort(conn.host, port)
+  failConnection(conn, `保持远端运行模式启动失败：${reason}`, `[setup] 后台启动失败（${code}）`)
+  return false
+}
+
+/** 结束远端端口上的 dsh 进程（可等待；用于失败回收、重启与关闭保活时的清理）。 */
+function killRemoteDshNow(host, port) {
+  if (!host || typeof port !== 'number') return Promise.resolve(false)
+  return resolveSsh()
+    .then(
+      (ssh) =>
+        new Promise((resolvePromise) => {
+          if (!ssh.available) {
+            resolvePromise(false)
+            return
+          }
+          const command = encodeRemoteScript(buildRemotePortCleanupScript(port))
+          execFile(
+            ssh.path,
+            buildRemoteCommandArgs(host, command),
+            { windowsHide: true, timeout: 8000 },
+            () => resolvePromise(true),
+          )
+        }),
+    )
+    .catch(() => false)
+}
+
+/** 结束远端端口上的 dsh 进程（尽力而为，不等待结果）。 */
+function killRemoteDshOnPort(host, port) {
+  void killRemoteDshNow(host, port)
+}
+
 /** 断开连接时尽力清理远端监听端口上的 dsh，避免残留阻塞下次连接。 */
 function cleanupRemotePort(conn) {
   if (!conn || conn.mode !== 'launch') return
+  if (isDetachedLaunch(conn.host)) {
+    appendLogLine(conn, '[disconnect] 已保留远端 dsh（保持远端运行）')
+    return
+  }
   const port = conn.remotePort || (conn.host && conn.host.remotePort)
-  if (typeof port !== 'number') return
-  void resolveSsh()
-    .then((ssh) => {
-      if (!ssh.available) return
-      const command = encodeRemoteScript(buildRemotePortCleanupScript(port))
-      execFile(
-        ssh.path,
-        buildRemoteCommandArgs(conn.host, command),
-        { windowsHide: true, timeout: 8000 },
-        () => {
-          // 尽力而为：清理失败不影响本地断开。
-        },
-      )
-    })
-    .catch(() => {})
+  killRemoteDshOnPort(conn.host, port)
 }
 
 /**
@@ -1059,9 +1257,15 @@ async function beginSshConnection(conn) {
     if (conn.host.mode === 'launch') {
       const ready = await ensureRemoteDsh(conn, ssh.path)
       if (!ready || conn.status !== 'connecting') return
-      // 上一次连接可能留下/残留占用远端端口：清理残留或换一个空闲端口。
-      const prepared = await prepareRemotePort(conn, ssh.path)
-      if (!prepared || conn.status !== 'connecting') return
+      if (isDetachedLaunch(conn.host)) {
+        // 保持远端运行：远端进程常驻（缺省复用上一次的），这里只准备令牌与端口。
+        const prepared = await prepareDetachedRemoteDsh(conn, ssh.path)
+        if (!prepared || conn.status !== 'connecting') return
+      } else {
+        // 上一次连接可能留下/残留占用远端端口：清理残留或换一个空闲端口。
+        const prepared = await prepareRemotePort(conn, ssh.path)
+        if (!prepared || conn.status !== 'connecting') return
+      }
     }
 
     const localPort = await allocateLocalPort()
@@ -1095,8 +1299,8 @@ async function beginSshConnection(conn) {
     }, CONNECT_TIMEOUT_MS)
     if (typeof conn.deadlineTimer.unref === 'function') conn.deadlineTimer.unref()
 
-    // attach 模式没有启动行可解析，spawn 后立即开始探活。
-    if (conn.mode === 'attach') beginProbe(conn)
+    // attach 与保持远端运行的 launch 都没有启动行可解析，spawn 后立即开始探活。
+    if (conn.mode === 'attach' || isDetachedLaunch(conn.host)) beginProbe(conn)
   } catch (error) {
     failConnection(conn, `建立 SSH 连接失败：${toMessage(error)}`)
   }
@@ -1979,6 +2183,56 @@ async function disconnectHostById(rawId) {
   return { ok: true }
 }
 
+/**
+ * POST /restart：手动重启远端 dsh。
+ * 结束远端端口上的 dsh（保持远端运行时也强制结束，这是「重启」的语义），等端口释放，
+ * 再重建连接与隧道；attach 模式只重建隧道，不结束别人的进程。
+ */
+async function restartHost(rawId) {
+  await ensureStore()
+  const host = findHost(rawId)
+  if (host === null) throw httpError(404, '未找到该远程主机')
+  if (host.mode === 'url') throw httpError(400, '直接 URL 模式没有可重启的远端进程')
+
+  const conn = connections.get(host.id) ?? null
+  const port =
+    conn !== null && typeof conn.remotePort === 'number' ? conn.remotePort : host.remotePort
+
+  if (conn !== null) {
+    clearConnectionTimers(conn)
+    terminateChild(conn)
+    flushLineBuffer(conn)
+    conn.status = 'disconnected'
+    conn.url = null
+    conn.localPort = null
+    connections.delete(host.id)
+  }
+
+  if (host.mode === 'launch' && typeof port === 'number') {
+    try {
+      const ssh = await resolveSsh()
+      if (ssh.available) {
+        const command = encodeRemoteScript(buildRemoteRestartScript(port))
+        await new Promise((resolvePromise) => {
+          execFile(
+            ssh.path,
+            buildRemoteCommandArgs(host, command),
+            { windowsHide: true, timeout: 15_000 },
+            () => resolvePromise(),
+          )
+        })
+      }
+    } catch {
+      // 尽力而为：即使结束失败也继续重连，新连接会再处理端口占用。
+    }
+  }
+
+  startConnection(host)
+  const fresh = connections.get(host.id) ?? null
+  if (fresh !== null) appendLogLine(fresh, '[restart] 已按请求重启远端 dsh')
+  return { ok: true }
+}
+
 /** POST /test：同步跑一次 SSH 测试。 */
 async function testHost(rawId) {
   await ensureStore()
@@ -2004,6 +2258,10 @@ async function handlePostRoute(route, req) {
   if (route === `POST ${API_PREFIX}/disconnect`) {
     const body = await readJsonBody(req)
     return disconnectHostById(body?.id)
+  }
+  if (route === `POST ${API_PREFIX}/restart`) {
+    const body = await readJsonBody(req)
+    return restartHost(body?.id)
   }
   if (route === `POST ${API_PREFIX}/test`) {
     const body = await readJsonBody(req)
@@ -2060,6 +2318,12 @@ async function handleRequest(ctx, req, res) {
     jsonResponse(res, status, { ok: false, error: toMessage(error) })
   }
 }
+
+/* ========================================================================== *
+ * 协议/脚本纯函数（导出供测试单独校验，不改变插件运行时行为）
+ * ========================================================================== */
+
+export { buildRemoteDetachedLaunchScript, buildSshArgs, isDetachedLaunch }
 
 /* ========================================================================== *
  * 插件入口

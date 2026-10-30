@@ -188,6 +188,9 @@ window.__ModuleLoader__.load({
       .rd-remoteLoginText { flex: 1 1 auto; min-width: 0; font-size: 12px; line-height: 1.5; color: var(--dsw-alias-label-primary); }
       .rd-remoteInfo { flex: none; display: flex; align-items: flex-start; gap: 8px; padding: 7px 10px; border-top: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-1); }
       .rd-remoteInfoText { flex: 1 1 auto; min-width: 0; font-size: 11.5px; line-height: 1.5; color: var(--dsw-alias-label-secondary); white-space: pre-wrap; word-break: break-word; }
+      .rd-check { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--dsw-alias-label-primary); cursor: pointer; }
+      .rd-check input { width: 14px; height: 14px; margin: 0; flex: none; accent-color: var(--dsw-alias-brand-primary); cursor: pointer; }
+      .rd-check input:disabled { cursor: default; }
       .rd-statusPage { flex: 1 1 auto; min-height: 0; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; }
       .rd-remoteStatusInline { position: static; inset: auto; background: transparent; flex: none; }
 
@@ -305,6 +308,12 @@ window.__ModuleLoader__.load({
       launchHint: '命令中的 {port} 会被替换成远端端口。',
       fieldInstallCommand: '自动安装命令',
       installHint: '首次连接时若远端没有 dsh，会自动执行这条命令安装（仅「SSH 启动远端 dsh」模式；需要远端有 npm 和网络）。',
+      fieldKeepRunning: '断开后保持远端运行',
+      keepRunningHint:
+        '开启后远端 dsh 会脱离 SSH 会话在后台常驻：点「返回」「断开」或关掉本机应用，远端正在执行的任务都会继续；下次连接自动复用同一个进程（远端日志 ~/.dsh/remote-desktop-web.log）。',
+      restartRemote: '重启远端',
+      restarting: '重启中…',
+      restartHint: '结束远端服务器上的 dsh 进程并重新启动（会中断正在执行的任务）。',
       fieldToken: '访问令牌（可选）',
       tokenPlaceholder: '从远端 dsh web: 启动行复制',
       tokenHint: '对应远端「dsh web: …?token=…」启动行里的 token；留空则不带令牌。',
@@ -429,6 +438,12 @@ window.__ModuleLoader__.load({
       launchHint: '`{port}` in the command is replaced with the remote port.',
       fieldInstallCommand: 'Auto-install command',
       installHint: 'On the first connection, if dsh is missing remotely this command runs to install it (launch mode only; the remote host needs npm and network access).',
+      fieldKeepRunning: 'Keep the remote dsh running after disconnect',
+      keepRunningHint:
+        'When enabled the remote dsh detaches from the SSH session and keeps running: Back, Disconnect and even quitting this app leave remote tasks running, and the next connection reuses the same process (remote log ~/.dsh/remote-desktop-web.log).',
+      restartRemote: 'Restart remote',
+      restarting: 'Restarting…',
+      restartHint: 'Stop the remote dsh process and start it again (interrupts running tasks).',
       fieldToken: 'Access token (optional)',
       tokenPlaceholder: 'Copy from the remote "dsh web:" line',
       tokenHint: 'The token from the remote "dsh web: …?token=…" line; leave empty to omit it.',
@@ -604,6 +619,7 @@ window.__ModuleLoader__.load({
         remotePort: String(DEFAULT_REMOTE_PORT),
         launchCommand: DEFAULT_LAUNCH_COMMAND,
         installCommand: DEFAULT_INSTALL_COMMAND,
+        keepRemoteRunning: false,
         token: '',
         url: '',
       }
@@ -621,6 +637,7 @@ window.__ModuleLoader__.load({
         remotePort: host.remotePort == null ? String(DEFAULT_REMOTE_PORT) : String(host.remotePort),
         launchCommand: host.launchCommand || DEFAULT_LAUNCH_COMMAND,
         installCommand: host.installCommand || DEFAULT_INSTALL_COMMAND,
+        keepRemoteRunning: host.keepRemoteRunning === true,
         token: host.token || '',
         url: host.url || '',
       }
@@ -644,6 +661,7 @@ window.__ModuleLoader__.load({
         identityFile: draft.identityFile.trim(),
         launchCommand: draft.launchCommand.trim(),
         installCommand: mode === 'launch' ? draft.installCommand.trim() || DEFAULT_INSTALL_COMMAND : '',
+        keepRemoteRunning: mode === 'launch' ? draft.keepRemoteRunning === true : false,
         token: mode === 'attach' ? draft.token.trim() : '',
         url: '',
         port: DEFAULT_SSH_PORT,
@@ -831,7 +849,7 @@ window.__ModuleLoader__.load({
          * 远端 dsh 的 SameSite=Strict 登录态才能生效；普通 iframe 会被跨站拦截。
          */
         function RemoteView(props) {
-          const { hostId, name, url, t, fmt, onBack, onDisconnect, onOpenExternal, busy } = props
+          const { hostId, name, url, t, fmt, onBack, onDisconnect, onRestart, restartBusy, onOpenExternal, busy } = props
           const hostRef = useRef(null)
           const viewRef = useRef(null)
           const [phase, setPhase] = useState('opening')
@@ -1328,6 +1346,17 @@ window.__ModuleLoader__.load({
               h('button', { type: 'button', className: 'rd-btn rd-btnSmall', onClick: reloadView }, t('reload')),
               h(
                 'button',
+                {
+                  type: 'button',
+                  className: 'rd-btn rd-btnSmall',
+                  disabled: busy || restartBusy,
+                  onClick: onRestart,
+                  title: t('restartHint'),
+                },
+                restartBusy ? t('restarting') : t('restartRemote'),
+              ),
+              h(
+                'button',
                 { type: 'button', className: 'rd-btn rd-btnSmall rd-btnDanger', disabled: busy, onClick: onDisconnect },
                 t('disconnect'),
               ),
@@ -1393,6 +1422,8 @@ window.__ModuleLoader__.load({
           const [error, setError] = useState('')
           const [target, setTarget] = useState(null)
           const [logTail, setLogTail] = useState([])
+          const [generation, setGeneration] = useState(0)
+          const [restartBusy, setRestartBusy] = useState(false)
           const connectRequested = useRef(false)
 
           useEffect(() => {
@@ -1400,6 +1431,7 @@ window.__ModuleLoader__.load({
             let timer = null
             let logTimer = null
             let lastReportedLogLine = ''
+            connectRequested.current = false
             collapseLocalSidebar()
             /**
              * 远端 ssh 子进程的输出（含远端 dsh 自己的 stderr，例如
@@ -1481,7 +1513,7 @@ window.__ModuleLoader__.load({
               if (logTimer !== null) clearInterval(logTimer)
               restoreLocalSidebar()
             }
-          }, [hostId])
+          }, [hostId, generation])
 
           /** 返回本地桌面界面（会话），而不是配置页。 */
           const backToLocal = () => {
@@ -1490,6 +1522,26 @@ window.__ModuleLoader__.load({
             } catch {
               // 忽略切换失败。
             }
+          }
+
+          /** 手动重启远端 dsh：Host 结束远端进程并等端口释放，然后重建连接与隧道。 */
+          const restartRemote = () => {
+            if (restartBusy) return
+            setRestartBusy(true)
+            setError('')
+            postJson('/restart', { id: hostId })
+              .then(() => {
+                setTarget(null)
+                setLogTail([])
+                setPhase('connecting')
+                connectRequested.current = false
+                setGeneration((value) => value + 1)
+              })
+              .catch((cause) => {
+                setPhase('error')
+                setError(String((cause && cause.message) || cause))
+              })
+              .finally(() => setRestartBusy(false))
           }
 
           const disconnect = () => {
@@ -1511,6 +1563,8 @@ window.__ModuleLoader__.load({
                 fmt,
                 onBack: backToLocal,
                 onDisconnect: disconnect,
+                onRestart: restartRemote,
+                restartBusy,
                 onOpenExternal: () => {
                   void openExternalUrl(target.url)
                 },
@@ -1534,6 +1588,17 @@ window.__ModuleLoader__.load({
                       'div',
                       { className: 'rd-remoteStatusActions' },
                       h('button', { type: 'button', className: 'rd-btn rd-btnSmall', onClick: backToLocal }, t('back')),
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'rd-btn rd-btnSmall',
+                          disabled: restartBusy,
+                          onClick: restartRemote,
+                          title: t('restartHint'),
+                        },
+                        restartBusy ? t('restarting') : t('restartRemote'),
+                      ),
                     ),
                   )
                 : h(
@@ -1914,6 +1979,18 @@ window.__ModuleLoader__.load({
                       h('p', { className: 'rd-hint rd-fieldFull' }, t('launchHint')),
                       field(t('fieldInstallCommand'), textInput('installCommand'), true),
                       h('p', { className: 'rd-hint rd-fieldFull' }, t('installHint')),
+                      h(
+                        'label',
+                        { className: 'rd-check rd-fieldFull' },
+                        h('input', {
+                          type: 'checkbox',
+                          checked: draft.keepRemoteRunning === true,
+                          disabled: actionBusy,
+                          onChange: (event) => updateDraft({ keepRemoteRunning: event.target.checked }),
+                        }),
+                        h('span', null, t('fieldKeepRunning')),
+                      ),
+                      h('p', { className: 'rd-hint rd-fieldFull' }, t('keepRunningHint')),
                     )
                   : h(
                       'div',

@@ -59,13 +59,15 @@ if (admission.peer.principal.kind !== 'owner') return jsonResponse(res, 403, { o
 - `POST /hosts/delete` body `{ id }` → 先断开再删除 → `{ ok:true }`
 - `POST /connect`    body `{ id }` → 立即返回 `{ ok:true }`，后台连接，客户端轮询 `/state`
 - `POST /disconnect` body `{ id }` → `{ ok:true }`
+- `POST /restart`    body `{ id }` → 手动重启远端：结束远端端口上的 dsh 并等端口释放，
+  再重建连接与隧道 → `{ ok:true }`（`url` 模式 400；未知 id 404）
 - `POST /test`       body `{ id }` → 同步跑一次 SSH 测试（≤15s）→ `{ ok:true, output }` 或 `{ ok:false, error }`
 - `POST /client-report` body `{ report }` → 追加一行 JSON 到 `$DSH_HOME/remote-desktop-client.log`
 - `POST /open-url`    body `{ url }` → 用 Host 所在机器的默认浏览器打开该链接
   （远端登录授权页用；仅 http(s)、≤4096 字符、不含账号口令）→ `{ ok:true, opened:true, via }`
 
 `HostView = { id, name, mode, host, port, user, identityFile, remotePort,
-launchCommand, token, url, updatedAt }`
+launchCommand, installCommand, keepRemoteRunning, token, url, updatedAt }`
 `ConnectionView = { id, status, url, error, log, localPort, startedAt }`
 - `status`: `'connecting' | 'connected' | 'error' | 'disconnected'`
 - `url`: iframe 地址，仅 `connected` 时有值
@@ -74,12 +76,15 @@ launchCommand, token, url, updatedAt }`
 `mode` 三种：
 - `'launch'`：SSH 连上后在远端启动 dsh web（默认命令见下），解析启动行里的 token，
   把本地端口转发到远端端口，iframe 指向 `http://127.0.0.1:<localPort>/?token=<token>`。
+  `keepRemoteRunning: true` 时改为「后台常驻」：远端用 `setsid nohup` 脱离 SSH 会话启动，
+  token 从远端 `~/.dsh/remote-desktop-web.log` 读回，隧道只做 `-L`（不再执行远端命令）。
 - `'attach'`：远端已有 dsh web 在跑，只建端口转发；`token` 由用户填（可空）。
 - `'url'`：不做 SSH，直接把用户给的完整 URL 作为 iframe 地址。
 
 HostInput 校验：`name` ≤80；`mode` 三选一；`host`/`user`/`identityFile` 字符串
 （去掉首尾空白）；`port` 默认 22、`remotePort` 默认 39080，范围 1–65535；
 `launchCommand` 默认 `dsh --profile web --port {port} --no-open`（`{port}` 替换为 remotePort）；
+`keepRemoteRunning` 仅 `'launch'` 模式保留（布尔，默认 `false`），其他模式强制 `false`；
 `url` 仅 `'url'` 模式要求是合法 http(s) URL；`token` ≤256。
 
 ### 持久化
@@ -111,6 +116,14 @@ HostInput 校验：`name` ≤80；`mode` 三选一；`host`/`user`/`identityFile
    `disconnected`。
 7. 断开：`child.kill()`，2 秒后仍活着则 win32 `taskkill /pid <pid> /T /F`。
 8. 插件卸载（`ctx.effect` 清理）时断开所有连接。
+9. `keepRemoteRunning: true` 时（「断开后保持远端运行」）流程改为：
+   1. 先用远端脚本探测端口：有 dsh → 从 `~/.dsh/remote-desktop-web.log` 里按
+      `:<port>/?token=` 取回令牌并复用（`REUSE=1`）；端口空闲 → `setsid nohup` 后台启动，
+      只读取本次新增日志行里的令牌（`REUSE=0`）；端口被别人占用 → 明确失败（`FAILED=port-busy`）。
+   2. 隧道只做 `-L`（等价 attach 的 `-N`），不再把 dsh 作为 ssh 会话子进程。
+   3. 断开/退出应用**不清理**远端进程（`cleanupRemotePort` 直接返回），因此远端任务继续，
+      下次连接复用同一进程；`POST /restart` 是唯一会强制结束它的操作。
+   4. 远端日志固定为 `~/.dsh/remote-desktop-web.log`（>2 MB 时轮转为 `.1`）。
 
 SSH 测试：`ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new
 -p <port> [-i <key>] <user>@<host> "echo dsh-ssh-ok"`，12s 超时，返回输出或错误。
@@ -493,6 +506,31 @@ v0.9.9 上线后实测（日志）：点击「登录」即自动在本地浏览�
 已知遗留（不影响使用）：远端 `GET /auth-api/v0/users/current` 返回 403，
 表现为账号资料/余额读取失败（`[deepseek-account] account read failed`，已被 UI 抑制）；
 而 `https://api.deepseek.com/models` 正常返回 2 个模型，对话可用。
+
+### v0.10.0 — 「断开后保持远端运行」+「重启远端」
+
+需求：点「返回」后远端任务要能继续跑；关掉本机应用也不该杀掉远端任务；并且需要一个
+手动重启远端 dsh 的按钮。
+
+设计取舍：launch 模式的远端 dsh 原本是 ssh 会话的子进程，SSH 一断就被 SIGHUP 带走，
+而且插件还会主动 `fuser` 清理端口。为此新增 `HostInput.keepRemoteRunning`（默认 false，
+保持原有行为）：
+
+- 启动：远端脚本用 `setsid nohup sh -c '<launchCommand>' >> ~/.dsh/remote-desktop-web.log`
+  脱离会话常驻，令牌从日志里按 `:<port>/?token=` 读回（只读本次新增行，避免拿到旧进程令牌）；
+  隧道改为 `-N` 纯转发。远端实测：启动 5s 内拿到令牌，SSH 退出后进程 PPID=1 仍存活。
+- 复用：再次连接时探测端口，命中 dsh 就复用同一进程（`REUSE=1`，令牌不变），任务不中断。
+- 断开：`cleanupRemotePort()` 对保活主机直接返回，不杀远端；插件卸载/退出应用同理。
+- 端口策略：保活模式固定用配置的 `remotePort`（不自动换端口），被别人占用则明确报错，
+  避免悄悄起第二个进程或复用到无关实例。
+
+「重启远端」：新增 `POST /restart`，先结束远端端口上的 dsh（最多等 6s 释放端口，保活模式
+也强制结束——这正是「重启」的语义），再重建连接与隧道；attach 模式只重建隧道。客户端在
+远端视图顶栏加了「重启远端」按钮（连接失败页也有），点击后重新走一遍连接流程。
+
+对应测试：`test/detached-smoke.mjs`（argv 与脚本约束）、host-smoke 新增保活字段与
+`/restart` 校验；远端脚本的语法与行为在真实 Linux 服务器上用 `sh -n` + 两次运行验证。
+
 
 
 
