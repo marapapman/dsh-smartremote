@@ -270,21 +270,25 @@ async function main() {
     })
     check('installCommand cleared for non-launch mode', urlHostInstall.payload?.host?.installCommand === '')
 
-    // 4c. 保持远端运行（keepRemoteRunning）：默认 false / launch 生效 / 非 launch 强制 false / 持久化
+    // 4c. 保持远端运行（keepRemoteRunning）：默认 true / 可显式关闭 / 非 launch 强制 false / 持久化
     const keepDefault = await call(base, 'POST', `${prefix}/hosts`, {
-      host: { name: 'Keep Off', mode: 'launch', host: 'example.com' },
+      host: { name: 'Keep Default', mode: 'launch', host: 'example.com' },
     })
-    check('keepRemoteRunning defaults false', keepDefault.payload?.host?.keepRemoteRunning === false)
+    check('keepRemoteRunning defaults true', keepDefault.payload?.host?.keepRemoteRunning === true)
     const keepId = keepDefault.payload?.host?.id
+    const keepOff = await call(base, 'POST', `${prefix}/hosts`, {
+      host: { id: keepId, name: 'Keep Off', mode: 'launch', host: 'example.com', keepRemoteRunning: false },
+    })
+    check('keepRemoteRunning can be turned off', keepOff.payload?.host?.keepRemoteRunning === false)
+    const keepStore = JSON.parse(await readFile(join(home, 'remote-desktop.json'), 'utf8'))
+    check(
+      'keepRemoteRunning persisted',
+      keepStore.hosts.find((host) => host.id === keepId)?.keepRemoteRunning === false,
+    )
     const keepOn = await call(base, 'POST', `${prefix}/hosts`, {
       host: { id: keepId, name: 'Keep On', mode: 'launch', host: 'example.com', keepRemoteRunning: true },
     })
     check('keepRemoteRunning enabled on launch host', keepOn.payload?.host?.keepRemoteRunning === true)
-    const keepStore = JSON.parse(await readFile(join(home, 'remote-desktop.json'), 'utf8'))
-    check(
-      'keepRemoteRunning persisted',
-      keepStore.hosts.find((host) => host.id === keepId)?.keepRemoteRunning === true,
-    )
     const keeplessAttach = await call(base, 'POST', `${prefix}/hosts`, {
       host: { name: 'Keep Attach', mode: 'attach', host: 'example.com', keepRemoteRunning: true },
     })

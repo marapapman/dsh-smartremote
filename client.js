@@ -308,12 +308,15 @@ window.__ModuleLoader__.load({
       launchHint: '命令中的 {port} 会被替换成远端端口。',
       fieldInstallCommand: '自动安装命令',
       installHint: '首次连接时若远端没有 dsh，会自动执行这条命令安装（仅「SSH 启动远端 dsh」模式；需要远端有 npm 和网络）。',
-      fieldKeepRunning: '断开后保持远端运行',
+      fieldKeepRunning: '断开后保持远端运行（默认开启）',
       keepRunningHint:
-        '开启后远端 dsh 会脱离 SSH 会话在后台常驻：点「返回」「断开」或关掉本机应用，远端正在执行的任务都会继续；下次连接自动复用同一个进程（远端日志 ~/.dsh/remote-desktop-web.log）。',
+        '开启后远端 dsh 会脱离 SSH 会话在后台常驻：点「返回」「断开」、本机睡眠或关掉应用，远端正在执行的任务都会继续；隧道断开时还会自动重连。关闭后远端 dsh 会随 SSH 会话结束而终止。远端日志 ~/.dsh/remote-desktop-web.log。',
       restartRemote: '重启远端',
       restarting: '重启中…',
       restartHint: '结束远端服务器上的 dsh 进程并重新启动（会中断正在执行的任务）。',
+      keepAliveOffHint:
+        '当前未开启「断开后保持远端运行」：本机睡眠、断网或断开连接会终止远端正在执行的任务。',
+      keepAliveEnable: '开启并重启远端',
       fieldToken: '访问令牌（可选）',
       tokenPlaceholder: '从远端 dsh web: 启动行复制',
       tokenHint: '对应远端「dsh web: …?token=…」启动行里的 token；留空则不带令牌。',
@@ -438,12 +441,15 @@ window.__ModuleLoader__.load({
       launchHint: '`{port}` in the command is replaced with the remote port.',
       fieldInstallCommand: 'Auto-install command',
       installHint: 'On the first connection, if dsh is missing remotely this command runs to install it (launch mode only; the remote host needs npm and network access).',
-      fieldKeepRunning: 'Keep the remote dsh running after disconnect',
+      fieldKeepRunning: 'Keep the remote dsh running after disconnect (on by default)',
       keepRunningHint:
-        'When enabled the remote dsh detaches from the SSH session and keeps running: Back, Disconnect and even quitting this app leave remote tasks running, and the next connection reuses the same process (remote log ~/.dsh/remote-desktop-web.log).',
+        'When enabled the remote dsh detaches from the SSH session and keeps running: Back, Disconnect, host sleep and even quitting this app leave remote tasks running, and a dropped tunnel reconnects automatically. When disabled the remote dsh ends with the SSH session. Remote log ~/.dsh/remote-desktop-web.log.',
       restartRemote: 'Restart remote',
       restarting: 'Restarting…',
       restartHint: 'Stop the remote dsh process and start it again (interrupts running tasks).',
+      keepAliveOffHint:
+        'Keeping the remote dsh running is off: sleeping, losing the network or disconnecting terminates running remote tasks.',
+      keepAliveEnable: 'Enable and restart remote',
       fieldToken: 'Access token (optional)',
       tokenPlaceholder: 'Copy from the remote "dsh web:" line',
       tokenHint: 'The token from the remote "dsh web: …?token=…" line; leave empty to omit it.',
@@ -619,7 +625,7 @@ window.__ModuleLoader__.load({
         remotePort: String(DEFAULT_REMOTE_PORT),
         launchCommand: DEFAULT_LAUNCH_COMMAND,
         installCommand: DEFAULT_INSTALL_COMMAND,
-        keepRemoteRunning: false,
+        keepRemoteRunning: true,
         token: '',
         url: '',
       }
@@ -637,7 +643,7 @@ window.__ModuleLoader__.load({
         remotePort: host.remotePort == null ? String(DEFAULT_REMOTE_PORT) : String(host.remotePort),
         launchCommand: host.launchCommand || DEFAULT_LAUNCH_COMMAND,
         installCommand: host.installCommand || DEFAULT_INSTALL_COMMAND,
-        keepRemoteRunning: host.keepRemoteRunning === true,
+        keepRemoteRunning: host.keepRemoteRunning !== false,
         token: host.token || '',
         url: host.url || '',
       }
@@ -849,7 +855,22 @@ window.__ModuleLoader__.load({
          * 远端 dsh 的 SameSite=Strict 登录态才能生效；普通 iframe 会被跨站拦截。
          */
         function RemoteView(props) {
-          const { hostId, name, url, t, fmt, onBack, onDisconnect, onRestart, restartBusy, onOpenExternal, busy } = props
+          const {
+            hostId,
+            name,
+            url,
+            t,
+            fmt,
+            onBack,
+            onDisconnect,
+            onRestart,
+            restartBusy,
+            keepRunning,
+            keepBusy,
+            onEnableKeepRunning,
+            onOpenExternal,
+            busy,
+          } = props
           const hostRef = useRef(null)
           const viewRef = useRef(null)
           const [phase, setPhase] = useState('opening')
@@ -1367,6 +1388,23 @@ window.__ModuleLoader__.load({
               h('div', { className: 'rd-remoteHost', ref: hostRef }),
               status,
             ),
+            phase === 'ready' && keepRunning === false
+              ? h(
+                  'div',
+                  { className: 'rd-remoteInfo' },
+                  h('span', { className: 'rd-remoteInfoText' }, t('keepAliveOffHint')),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'rd-btn rd-btnSmall rd-btnPrimary',
+                      disabled: keepBusy || restartBusy,
+                      onClick: onEnableKeepRunning,
+                    },
+                    keepBusy ? t('restarting') : t('keepAliveEnable'),
+                  ),
+                )
+              : null,
             phase === 'ready' && loginUrl
               ? h(
                   'div',
@@ -1424,6 +1462,9 @@ window.__ModuleLoader__.load({
           const [logTail, setLogTail] = useState([])
           const [generation, setGeneration] = useState(0)
           const [restartBusy, setRestartBusy] = useState(false)
+          const [keepRunning, setKeepRunning] = useState(true)
+          const [keepBusy, setKeepBusy] = useState(false)
+          const [currentHost, setCurrentHost] = useState(null)
           const connectRequested = useRef(false)
 
           useEffect(() => {
@@ -1466,6 +1507,8 @@ window.__ModuleLoader__.load({
                   return
                 }
                 setHostName(host.name || host.host || fallbackName)
+                setCurrentHost(host)
+                setKeepRunning(host.keepRemoteRunning !== false)
                 const connection = (payload.active || {})[hostId] || null
                 if (connection && Array.isArray(connection.log)) setLogTail(connection.log.slice(-8))
                 if (connection && connection.status === 'connected' && connection.url) {
@@ -1550,6 +1593,22 @@ window.__ModuleLoader__.load({
               .finally(() => backToLocal())
           }
 
+          /** 一键开启「保持远端运行」：更新主机配置后重启远端，切到常驻模式。 */
+          const enableKeepRunning = () => {
+            if (keepBusy || !currentHost) return
+            setKeepBusy(true)
+            postJson('/hosts', { host: { ...currentHost, keepRemoteRunning: true } })
+              .then(() => {
+                setKeepRunning(true)
+                restartRemote()
+              })
+              .catch((cause) => {
+                setPhase('error')
+                setError(String((cause && cause.message) || cause))
+              })
+              .finally(() => setKeepBusy(false))
+          }
+
           if (phase === 'ready' && target) {
             return h(
               'div',
@@ -1565,6 +1624,9 @@ window.__ModuleLoader__.load({
                 onDisconnect: disconnect,
                 onRestart: restartRemote,
                 restartBusy,
+                keepRunning,
+                keepBusy,
+                onEnableKeepRunning: enableKeepRunning,
                 onOpenExternal: () => {
                   void openExternalUrl(target.url)
                 },

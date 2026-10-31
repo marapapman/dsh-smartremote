@@ -474,8 +474,9 @@ function validateHostInput(rawHost) {
   const installCommand =
     mode === 'launch' ? normalizeText(rawHost.installCommand, 4096) || DEFAULT_INSTALL_COMMAND : ''
   // 保持远端运行只对 launch 模式有意义：远端 dsh 以 setsid 后台启动、断开时不清理，
-  // 下次连接复用同一个进程（任务不中断）。
-  const keepRemoteRunning = mode === 'launch' ? rawHost.keepRemoteRunning === true : false
+  // 下次连接复用同一个进程（任务不中断）。缺省为 true：本机睡眠/断链不应杀掉远端任务；
+  // 显式存过 false 的主机保持 false（用户主动关闭）。
+  const keepRemoteRunning = mode === 'launch' ? rawHost.keepRemoteRunning !== false : false
   let name = normalizeText(rawHost.name, 80)
   if (!name) name = defaultHostName(mode, host, url)
 
@@ -608,6 +609,29 @@ function allocateLocalPort() {
   })
 }
 
+/**
+ * 优先复用指定本地端口（断链自动重连时用）：远端页面原本指向该端口的 URL，
+ * 端口不变则页面自带的断线重连能直接接回去；端口被占时退回随机空闲端口。
+ */
+async function allocateLocalPortPreferring(preferred) {
+  if (typeof preferred === 'number' && preferred > 0) {
+    const free = await new Promise((resolvePromise) => {
+      const server = createNetServer()
+      server.unref()
+      server.once('error', () => resolvePromise(false))
+      server.listen(preferred, '127.0.0.1', () => {
+        server.close(() => resolvePromise(true))
+      })
+    })
+    if (free) return preferred
+  }
+  try {
+    return await allocateLocalPort()
+  } catch {
+    return null
+  }
+}
+
 /* ========================================================================== *
  * ssh 参数构造
  * ========================================================================== */
@@ -620,6 +644,9 @@ function sshTarget(host) {
 function isDetachedLaunch(host) {
   return Boolean(host) && host.mode === 'launch' && host.keepRemoteRunning === true
 }
+
+/** 意外断链后的自动重连退避（保持远端运行才启用；远端任务不受影响）。 */
+const AUTO_RECONNECT_DELAYS_MS = [1500, 3000, 5000, 8000, 13000, 21000]
 
 /**
  * 建立转发连接的 argv。
@@ -911,34 +938,57 @@ async function prepareRemotePort(conn, sshPath) {
  * 因此断开/退出本机不会中断远端正在执行的任务。
  * 成功后设置 conn.remotePort 与 conn.token。
  */
+function parseDetachedLaunchResult(stdout) {
+  return {
+    reuse: /REUSE=1/.test(stdout),
+    token: (/TOKEN=([^\s]+)/.exec(stdout) ?? [])[1] ?? null,
+    failed: (/FAILED=([a-z-]+)/.exec(stdout) ?? [])[1] ?? null,
+  }
+}
+
 async function prepareDetachedRemoteDsh(conn, sshPath) {
   const port = conn.host.remotePort
   const launchCommand = (conn.host.launchCommand || DEFAULT_LAUNCH_COMMAND).replaceAll('{port}', String(port))
-  const script = buildRemoteDetachedLaunchScript(port, launchCommand)
-  const step = await runRemoteStep(
-    conn,
-    sshPath,
-    buildRemoteCommandArgs(conn.host, encodeRemoteScript(script)),
-    SETUP_PROBE_TIMEOUT_MS * 3,
+  const launchArgs = buildRemoteCommandArgs(
+    conn.host,
+    encodeRemoteScript(buildRemoteDetachedLaunchScript(port, launchCommand)),
   )
+  let step = await runRemoteStep(conn, sshPath, launchArgs, SETUP_PROBE_TIMEOUT_MS * 3)
   if (conn.status !== 'connecting') return false
+  let result = parseDetachedLaunchResult(step.stdout)
 
-  const reuse = /REUSE=1/.test(step.stdout)
-  const tokenMatch = /TOKEN=([^\s]+)/.exec(step.stdout)
-  const failed = /FAILED=([a-z-]+)/.exec(step.stdout)
-  if (tokenMatch !== null && failed === null) {
-    conn.remotePort = port
-    conn.token = tokenMatch[1]
+  // 迁移场景：端口上有一个 dsh，但它不是以常驻模式启动的（日志里没有令牌，例如
+  // v0.10.0 之前启动的旧实例）。结束它并以常驻模式重启一次，而不是把用户卡在错误上。
+  if (result.failed === 'reuse-no-token') {
     appendLogLine(
       conn,
-      reuse
+      `[setup] 远端端口 ${port} 上的 dsh 不是常驻模式启动的（没有令牌记录），正在重启为常驻模式`,
+    )
+    await runRemoteStep(
+      conn,
+      sshPath,
+      buildRemoteCommandArgs(conn.host, encodeRemoteScript(buildRemoteRestartScript(port))),
+      SETUP_PROBE_TIMEOUT_MS * 2,
+    )
+    if (conn.status !== 'connecting') return false
+    step = await runRemoteStep(conn, sshPath, launchArgs, SETUP_PROBE_TIMEOUT_MS * 3)
+    if (conn.status !== 'connecting') return false
+    result = parseDetachedLaunchResult(step.stdout)
+  }
+
+  if (result.token !== null && result.failed === null) {
+    conn.remotePort = port
+    conn.token = result.token
+    appendLogLine(
+      conn,
+      result.reuse
         ? `[setup] 复用远端已运行的 dsh（端口 ${port}），此前任务继续运行`
         : `[setup] 远端 dsh 已在后台常驻启动（端口 ${port}，日志 ${REMOTE_LAUNCH_LOG}）`,
     )
     return true
   }
 
-  const code = failed === null ? 'unknown' : failed[1]
+  const code = result.failed ?? 'unknown'
   const reason =
     code === 'port-busy'
       ? `远端端口 ${port} 被其他进程占用。请换一个远端端口，或改用「SSH 连接已运行的 dsh」模式。`
@@ -946,7 +996,7 @@ async function prepareDetachedRemoteDsh(conn, sshPath) {
         ? `远端端口 ${port} 上已有一个 dsh，但 ${REMOTE_LAUNCH_LOG} 里没有它的访问令牌。请在远端结束该进程后重试，或改用 attach 模式并手动填令牌。`
         : `远端 dsh 在后台启动后没有输出访问令牌。请检查「启动命令」，或查看远端日志 ${REMOTE_LAUNCH_LOG}。`
   // 仅当本次确实新起了一个进程时才清理，复用的进程绝不杀。
-  if (!reuse) killRemoteDshOnPort(conn.host, port)
+  if (!result.reuse) killRemoteDshOnPort(conn.host, port)
   failConnection(conn, `保持远端运行模式启动失败：${reason}`, `[setup] 后台启动失败（${code}）`)
   return false
 }
@@ -1150,6 +1200,11 @@ function createConnection(host) {
     child: null,
     deadlineTimer: null,
     probeTimer: null,
+    // 意外断链自动重连（仅保持远端运行）：已重试次数与定时器。
+    reconnectAttempt: 0,
+    reconnectTimer: null,
+    // 用户主动断开/重启时置位，避免自动重连把它拉回来。
+    userStopped: false,
   }
 }
 
@@ -1174,6 +1229,10 @@ function clearConnectionTimers(conn) {
   if (conn.probeTimer !== null) {
     clearTimeout(conn.probeTimer)
     conn.probeTimer = null
+  }
+  if (conn.reconnectTimer !== null && conn.reconnectTimer !== undefined) {
+    clearTimeout(conn.reconnectTimer)
+    conn.reconnectTimer = null
   }
 }
 
@@ -1215,6 +1274,7 @@ function markConnected(conn) {
   flushLineBuffer(conn)
   conn.status = 'connected'
   conn.error = null
+  conn.reconnectAttempt = 0
   conn.url = buildConnectionUrl(conn.localPort, conn.token)
   appendLogLine(conn, `[ready] 本地端口转发已就绪：127.0.0.1:${conn.localPort}`)
 }
@@ -1244,7 +1304,9 @@ function buildConnectTimeoutMessage(conn) {
 }
 
 /** 启动后按 SPEC 参数拉起 ssh，并挂上输出/退出/超时处理。 */
-async function beginSshConnection(conn) {
+async function beginSshConnection(conn, options = {}) {
+  const preferredLocalPort = typeof options.preferredLocalPort === 'number' ? options.preferredLocalPort : null
+  const skipDshCheck = options.skipDshCheck === true
   try {
     const ssh = await resolveSsh()
     if (conn.status !== 'connecting') return
@@ -1255,8 +1317,10 @@ async function beginSshConnection(conn) {
 
     // launch 模式：首次连接先确认远端有 dsh，缺失则自动安装，再建立隧道。
     if (conn.host.mode === 'launch') {
-      const ready = await ensureRemoteDsh(conn, ssh.path)
-      if (!ready || conn.status !== 'connecting') return
+      if (!skipDshCheck) {
+        const ready = await ensureRemoteDsh(conn, ssh.path)
+        if (!ready || conn.status !== 'connecting') return
+      }
       if (isDetachedLaunch(conn.host)) {
         // 保持远端运行：远端进程常驻（缺省复用上一次的），这里只准备令牌与端口。
         const prepared = await prepareDetachedRemoteDsh(conn, ssh.path)
@@ -1268,7 +1332,11 @@ async function beginSshConnection(conn) {
       }
     }
 
-    const localPort = await allocateLocalPort()
+    const localPort = await allocateLocalPortPreferring(preferredLocalPort)
+    if (localPort === null) {
+      failConnection(conn, '无法分配本地端口（可能是本机端口耗尽）。')
+      return
+    }
     if (conn.status !== 'connecting') return
     conn.localPort = localPort
 
@@ -1321,15 +1389,18 @@ function handleSshOutput(conn, chunk) {
   beginProbe(conn)
 }
 
-/** ssh 进程退出：已就绪 → disconnected；未就绪 → error。 */
+/** ssh 进程退出：已就绪 → disconnected（保持远端运行则自动重连）；未就绪 → error。 */
 function handleSshExit(conn, code, signal) {
   clearConnectionTimers(conn)
   flushLineBuffer(conn)
   if (conn.status === 'connected') {
     conn.status = 'disconnected'
     conn.url = null
-    conn.localPort = null
     appendLogLine(conn, `[ssh] 连接已退出（${formatExit(code, signal)}）`)
+    // 保持远端运行时，远端 dsh 还在跑：本机睡眠/断网后自动重连隧道，
+    // 并沿用同一本地端口，让远端页面自带的断线重连直接接回去。
+    if (!conn.userStopped && scheduleAutoReconnect(conn)) return
+    conn.localPort = null
     return
   }
   if (conn.status === 'connecting') {
@@ -1341,9 +1412,52 @@ function handleSshExit(conn, code, signal) {
     appendLogLine(conn, `[error] SSH 进程在连接就绪前退出（${formatExit(code, signal)}）`)
     // 启动失败时也尽力清理远端监听，避免残留阻塞下一次连接。
     cleanupRemotePort(conn)
+    // 自动重连期间网络可能尚未恢复：同样进入退避重试。
+    if (!conn.userStopped && scheduleAutoReconnect(conn)) return
     return
   }
   appendLogLine(conn, `[ssh] 进程已退出（${formatExit(code, signal)}）`)
+}
+
+/** 安排一次自动重连；返回 false 表示不重连（非保活主机、用户已停止或次数用尽）。 */
+function scheduleAutoReconnect(conn) {
+  if (conn.userStopped) return false
+  if (!isDetachedLaunch(conn.host)) return false
+  const attempt = typeof conn.reconnectAttempt === 'number' ? conn.reconnectAttempt : 0
+  if (attempt >= AUTO_RECONNECT_DELAYS_MS.length) {
+    appendLogLine(conn, '[reconnect] 自动重连次数已用尽，请手动点「重新加载」或「重启远端」')
+    conn.localPort = null
+    return false
+  }
+  conn.reconnectAttempt = attempt + 1
+  const delay = AUTO_RECONNECT_DELAYS_MS[attempt]
+  appendLogLine(
+    conn,
+    `[reconnect] 隧道已断开，${Math.round(delay / 1000)} 秒后自动重连（远端任务保持运行；第 ${attempt + 1}/${AUTO_RECONNECT_DELAYS_MS.length} 次）`,
+  )
+  conn.reconnectTimer = setTimeout(() => {
+    conn.reconnectTimer = null
+    retryConnection(conn)
+  }, delay)
+  if (typeof conn.reconnectTimer.unref === 'function') conn.reconnectTimer.unref()
+  return true
+}
+
+/** 用现有记录重试连接：沿用本地端口，跳过重复的 dsh 安装探测以加快恢复。 */
+function retryConnection(conn) {
+  if (conn.userStopped) return
+  if (conn.status === 'connecting' || conn.status === 'connected') return
+  const preferred = conn.localPort
+  clearConnectionTimers(conn)
+  terminateChild(conn)
+  flushLineBuffer(conn)
+  conn.status = 'connecting'
+  conn.error = null
+  conn.url = null
+  conn.token = null
+  beginSshConnection(conn, { preferredLocalPort: preferred, skipDshCheck: true }).catch((error) => {
+    if (conn.status === 'connecting') failConnection(conn, `自动重连失败：${toMessage(error)}`)
+  })
 }
 
 /** 开始探活：launch 需要先拿到 token，attach 立即探测。 */
@@ -1415,6 +1529,7 @@ function startConnection(host) {
 function disconnectHost(id, reason = '已断开连接') {
   const conn = connections.get(id)
   if (!conn) return
+  conn.userStopped = true
   clearConnectionTimers(conn)
   terminateChild(conn)
   flushLineBuffer(conn)
@@ -1430,6 +1545,7 @@ function disconnectHost(id, reason = '已断开连接') {
 /** 插件卸载时断开所有连接（SPEC 要求）。 */
 function disconnectAllConnections() {
   for (const conn of connections.values()) {
+    conn.userStopped = true
     clearConnectionTimers(conn)
     terminateChild(conn)
     flushLineBuffer(conn)
@@ -2199,6 +2315,7 @@ async function restartHost(rawId) {
     conn !== null && typeof conn.remotePort === 'number' ? conn.remotePort : host.remotePort
 
   if (conn !== null) {
+    conn.userStopped = true
     clearConnectionTimers(conn)
     terminateChild(conn)
     flushLineBuffer(conn)
