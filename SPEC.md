@@ -583,6 +583,37 @@ v0.10.0 之前保存的旧记录（没有 `keepRemoteRunning` 字段），因此
 4. 用户侧建议（插件无法代劳）：电池模式把「睡眠后」调长或改为插电；
    无线适配器「节能模式」设为最高性能（`powercfg /setdcvalueindex … 12bbebe6-… 0`）。
 
+### v0.10.3 — 修复「连接成功 ↔ 重连中」反复抖动
+
+现象：v0.10.2 之后，远端视图状态在「连接成功」和「连接重连中」之间反复切换。
+
+取证：
+
+- `~/.dsh/remote-desktop-ssh.log`：同一时段出现**交叠**的 `[setup] 步骤超时（约 75 秒）`
+  与 `步骤超时（约 25 秒）`，并且已经 `[ready]` 之后仍在继续超时；
+- 服务器侧 `ss -tn` 同时看到**多条**来自本机的 `:22` ESTAB 连接；
+- 远端 `dsh` 未重启（keep-alive 日志 token 行数不变、进程已运行 2 小时+）。
+
+根因：一次「自动重连」与一次「客户端 `/connect`（面板重挂载/用户点图标）」并发：
+
+1. 两条连接记录各自 `spawn` 自己的 ssh（一次性 setup + 隧道）；
+2. `conn.child` 原本是单槽，后启动的进程会覆盖前一个的引用，先启动的隧道因此**失去跟踪
+   变成孤儿**，继续占着本地转发端口；
+3. 孤儿占用端口 → 新隧道要么换端口（页面 URL 变化、webview 重挂 = 看起来像刷新），
+   要么 `ExitOnForwardFailure` 直接退出（255）→ 再触发重连 → 状态来回翻。
+
+修复：
+
+1. `createConnection` 增加 `children: Set`，所有 ssh 子进程（一次性步骤与隧道）都经
+   `trackChild()` 登记；`terminateChild()` 按集合全部结束，不再留孤儿。
+2. `connectHost`：主机已有记录（disconnected/error）时**复用同一记录**发起重连，并清除
+   待重连定时器与残留子进程，不再另起一条记录与自动重连并发。
+3. `startConnection`：创建新记录前先停掉同一主机的残留记录（定时器 + 子进程）。
+4. `retryConnection`：先 `terminateChild` 清掉残留，再重置状态重连（配合集合清理）。
+
+验证：`test/host-smoke.mjs` 70/70、`test/client-smoke.mjs` 15/15、
+`test/detached-smoke.mjs` 22/22；修复后日志不再出现同一时段交叠的 setup 步骤。
+
 
 
 

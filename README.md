@@ -333,6 +333,11 @@ SSH 隧道与远端界面需要真实服务器联调：添加一台能免密 SSH
   （`pkill -f "dsh --profile web"`）后重连，或改用「SSH 连接已运行的 dsh」模式手动填令牌。
 - 远端卡死、想清空远端状态：点远端视图顶栏「重启远端」；也可以在服务器上执行
   `pkill -f "dsh --profile web"` 后本地点「重新加载」重连。
+- **状态在「连接成功」和「重连中」之间反复切换**：这是并发连接导致的抖动，已在 v0.10.3
+  修复（重连与手动 `/connect` 复用同一条连接记录，所有 ssh 子进程按集合清理，不再留孤儿
+  占用本地端口）。如果仍出现，看 `~/.dsh/remote-desktop-ssh.log`：正常重连应该是
+  `[reconnect] → [setup] 复用远端已运行的 dsh → [ready]` 三步，且同一时刻不应出现多条
+  `[setup] 步骤超时`。
 - **频繁断线重连 / 远端 GUI 反复刷新**：先看 `~/.dsh/remote-desktop-ssh.log`。如果出现
   `Connection reset by <服务器> port 22` 或 `client_loop: send disconnect`，通常是本机
   网络或电源管理导致的（Windows「现代待机」会断开网卡），不是服务器踢人也不是插件出错。

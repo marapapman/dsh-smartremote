@@ -706,7 +706,7 @@ function runRemoteStep(conn, sshPath, args, timeoutMs) {
       finish(null)
       return
     }
-    conn.child = child
+    trackChild(conn, child)
     child.stdout?.setEncoding('utf8')
     child.stderr?.setEncoding('utf8')
     const collect = (chunk) => {
@@ -1200,6 +1200,8 @@ function createConnection(host) {
     lineBuffer: '',
     outputTail: '',
     child: null,
+    // 本次连接尝试创建过的所有 ssh 子进程（一次性步骤 + 隧道），清理时按集合结束，避免孤儿。
+    children: new Set(),
     deadlineTimer: null,
     probeTimer: null,
     // 意外断链自动重连（仅保持远端运行）：已重试次数与定时器。
@@ -1258,11 +1260,25 @@ function killProcessTree(child) {
   if (typeof timer.unref === 'function') timer.unref()
 }
 
-function terminateChild(conn) {
-  const child = conn.child
+/** 记录本次连接尝试创建的 ssh 子进程（一次性步骤与隧道都要跟踪，避免清理不干净留下孤儿）。 */
+function trackChild(conn, child) {
   if (!child) return
+  if (!conn.children) conn.children = new Set()
+  conn.children.add(child)
+  const forget = () => {
+    if (conn.children) conn.children.delete(child)
+  }
+  child.once('exit', forget)
+  child.once('error', forget)
+  conn.child = child
+}
+
+function terminateChild(conn) {
+  const all = new Set(conn.children ? [...conn.children] : [])
+  if (conn.child) all.add(conn.child)
   conn.child = null
-  killProcessTree(child)
+  if (conn.children) conn.children.clear()
+  for (const child of all) killProcessTree(child)
 }
 
 function buildConnectionUrl(localPort, token) {
@@ -1348,7 +1364,7 @@ async function beginSshConnection(conn, options = {}) {
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
-    conn.child = child
+    trackChild(conn, child)
     child.stdout?.setEncoding('utf8')
     child.stderr?.setEncoding('utf8')
     child.stdout?.on('data', (chunk) => handleSshOutput(conn, chunk))
@@ -1513,6 +1529,14 @@ function probeRemoteOnce(conn) {
 
 /** 发起连接（立即返回，后台推进状态，Client 轮询 /state）。 */
 function startConnection(host) {
+  // 防御：同一条主机若有残留记录（含待重连定时器与未退出的 ssh 子进程），先彻底停掉，
+  // 否则两份连接会并发抢本地端口，表现为「连上又断开」抖动。
+  const stale = connections.get(host.id) ?? null
+  if (stale !== null) {
+    stale.userStopped = true
+    clearConnectionTimers(stale)
+    terminateChild(stale)
+  }
   const record = createConnection(host)
   connections.set(host.id, record)
   if (host.mode === 'url') {
@@ -2284,8 +2308,25 @@ async function connectHost(rawId) {
   await ensureStore()
   const host = findHost(rawId)
   if (host === null) throw httpError(404, '未找到该远程主机')
-  const current = connections.get(host.id)
-  if (current && (current.status === 'connecting' || current.status === 'connected')) {
+  const current = connections.get(host.id) ?? null
+  if (current !== null && (current.status === 'connecting' || current.status === 'connected')) {
+    return { ok: true }
+  }
+  if (current !== null) {
+    // 已有记录但已断开/出错：沿用同一条记录重连。若另起一条记录，会和仍在退避中的
+    // 自动重连并发跑两份 ssh（孤儿隧道抢占本地端口），表现为「连上又断开」反复抖动。
+    current.userStopped = false
+    current.reconnectAttempt = 0
+    clearConnectionTimers(current)
+    terminateChild(current)
+    current.status = 'connecting'
+    current.error = null
+    current.url = null
+    current.token = null
+    appendLogLine(current, '[reconnect] 收到手动重连请求')
+    beginSshConnection(current, { preferredLocalPort: current.localPort }).catch((error) => {
+      if (current.status === 'connecting') failConnection(current, `建立 SSH 连接失败：${toMessage(error)}`)
+    })
     return { ok: true }
   }
   startConnection(host)
