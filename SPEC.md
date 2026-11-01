@@ -552,6 +552,37 @@ v0.10.0 之前保存的旧记录（没有 `keepRemoteRunning` 字段），因此
    按钮先 `POST /hosts` 写入 `keepRemoteRunning: true`，再走 `/restart` 切到常驻模式。
    设置表单的开关说明也改为「默认开启」。
 
+### v0.10.2 — 频繁断线重连的定位与缓解
+
+现象：v0.10.1 之后仍「频繁断线重连、远端 GUI 刷新」。
+
+取证（三段互相印证）：
+
+- 客户端 ssh 日志：`Connection reset by <server> port 22` / `client_loop: send disconnect:
+  Connection reset`；24 小时内 13 次 `code 255`，集中在 09:54–14:07 本地时间。
+- 服务端：`sshd_config` 全是默认值（`ClientAliveInterval 0`），无 OOM（内存 7.4G 用 5.5G），
+  断链时刻 sshd **没有任何断开原因日志**（会话凭空消失）→ 不是服务器踢人。
+- 本机：`Kernel-Power` 506/507 显示当天进入 **Modern Standby 16 次**（2 秒到 30 分钟），
+  且每次「进入待机」时间与断链时间一一对应；电池模式 `STANDBYIDLE=180s`（3 分钟无操作
+  即待机），待机期间网卡断开（`Connectivity state in standby: Disconnected, Adaptive`）。
+
+结论：这是本机电源管理导致的链路中断，不是插件或远端的问题。保活本身是生效的 ——
+远端 dsh 自 12:54 起持续运行 2 小时以上（PPID=1），期间多次断链都只重建隧道、没有重启远端，
+任务未受影响。
+
+缓解：
+
+1. Host：SSH 连接参数增加 `-o TCPKeepAlive=yes`，让中间设备持续看到流量，减少长连接被
+   静默回收/重置。
+2. Client：远端视图挂载期间申请 `navigator.wakeLock('screen')`（只在本机页面可见时持有，
+   `visibilitychange` 时释放），阻止「正在看远端界面时」因空闲进入现代待机；离开视图或
+   隐藏页面立即释放，不影响正常待机。
+3. Client：连接就绪后每 3 秒同步一次状态（`GET /state`），隧道中断/自动重连期间在远端
+   视图顶部显示提示条（`linkReconnecting` / `linkDown`），并在本地端口变化时自动同步新的
+   远端 URL（重挂 webview），不再需要用户手动「重新加载」。
+4. 用户侧建议（插件无法代劳）：电池模式把「睡眠后」调长或改为插电；
+   无线适配器「节能模式」设为最高性能（`powercfg /setdcvalueindex … 12bbebe6-… 0`）。
+
 
 
 

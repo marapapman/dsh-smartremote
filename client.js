@@ -317,6 +317,8 @@ window.__ModuleLoader__.load({
       keepAliveOffHint:
         '当前未开启「断开后保持远端运行」：本机睡眠、断网或断开连接会终止远端正在执行的任务。',
       keepAliveEnable: '开启并重启远端',
+      linkReconnecting: '网络或本机睡眠导致连接中断，正在自动重连…（远端任务会继续运行）',
+      linkDown: '隧道已断开，等待网络恢复后自动重连；远端任务仍在运行。也可点「重新加载」或「重启远端」。',
       fieldToken: '访问令牌（可选）',
       tokenPlaceholder: '从远端 dsh web: 启动行复制',
       tokenHint: '对应远端「dsh web: …?token=…」启动行里的 token；留空则不带令牌。',
@@ -450,6 +452,8 @@ window.__ModuleLoader__.load({
       keepAliveOffHint:
         'Keeping the remote dsh running is off: sleeping, losing the network or disconnecting terminates running remote tasks.',
       keepAliveEnable: 'Enable and restart remote',
+      linkReconnecting: 'Network loss or host sleep broke the tunnel; reconnecting automatically (remote tasks keep running).',
+      linkDown: 'Tunnel is down; it reconnects automatically when the network returns and remote tasks keep running. You can also use Reload or Restart remote.',
       fieldToken: 'Access token (optional)',
       tokenPlaceholder: 'Copy from the remote "dsh web:" line',
       tokenHint: 'The token from the remote "dsh web: …?token=…" line; leave empty to omit it.',
@@ -868,6 +872,7 @@ window.__ModuleLoader__.load({
             keepRunning,
             keepBusy,
             onEnableKeepRunning,
+            linkStatus,
             onOpenExternal,
             busy,
           } = props
@@ -891,6 +896,57 @@ window.__ModuleLoader__.load({
             let lastOpenedLogin = ''
             let reloadedOnce = false
             let unsubscribeOpen = null
+            /**
+             * 远端视图打开期间申请屏幕唤醒锁：本机因空闲进入现代待机会断开网卡，
+             * 进而切断 SSH 隧道（表现为频繁断线重连）。只要用户正在看远端界面，
+             * 就阻止屏幕休眠；离开视图或页面隐藏时释放，不影响正常待机。
+             */
+            let wakeLock = null
+            const acquireWakeLock = () => {
+              try {
+                const api = navigator && navigator.wakeLock
+                if (!api || typeof api.request !== 'function' || document.visibilityState !== 'visible') return
+                api
+                  .request('screen')
+                  .then((lock) => {
+                    if (disposed) {
+                      try {
+                        lock.release()
+                      } catch {
+                        // 忽略释放失败。
+                      }
+                      return
+                    }
+                    wakeLock = lock
+                  })
+                  .catch(() => {
+                    // 环境不支持或策略拒绝：静默降级。
+                  })
+              } catch {
+                // 忽略：唤醒锁只是体验优化。
+              }
+            }
+            const releaseWakeLock = () => {
+              const lock = wakeLock
+              wakeLock = null
+              if (!lock) return
+              try {
+                lock.release()
+              } catch {
+                // 忽略释放失败。
+              }
+            }
+            const onVisibilityChange = () => {
+              if (disposed) return
+              if (document.visibilityState === 'visible') acquireWakeLock()
+              else releaseWakeLock()
+            }
+            acquireWakeLock()
+            try {
+              document.addEventListener('visibilitychange', onVisibilityChange)
+            } catch {
+              // 忽略监听失败。
+            }
             const note = (text) => {
               if (disposed) return
               const clean = String(text || '').trim()
@@ -1295,6 +1351,12 @@ window.__ModuleLoader__.load({
                 // 忽略 DOM 清理失败。
               }
               element = null
+              releaseWakeLock()
+              try {
+                document.removeEventListener('visibilitychange', onVisibilityChange)
+              } catch {
+                // 忽略移除失败。
+              }
               releaseLease()
             }
           }, [hostId, url])
@@ -1388,6 +1450,17 @@ window.__ModuleLoader__.load({
               h('div', { className: 'rd-remoteHost', ref: hostRef }),
               status,
             ),
+            phase === 'ready' && linkStatus !== 'connected'
+              ? h(
+                  'div',
+                  { className: 'rd-remoteInfo' },
+                  h(
+                    'span',
+                    { className: 'rd-remoteInfoText' },
+                    linkStatus === 'connecting' ? t('linkReconnecting') : t('linkDown'),
+                  ),
+                )
+              : null,
             phase === 'ready' && keepRunning === false
               ? h(
                   'div',
@@ -1465,6 +1538,7 @@ window.__ModuleLoader__.load({
           const [keepRunning, setKeepRunning] = useState(true)
           const [keepBusy, setKeepBusy] = useState(false)
           const [currentHost, setCurrentHost] = useState(null)
+          const [linkStatus, setLinkStatus] = useState('connected')
           const connectRequested = useRef(false)
 
           useEffect(() => {
@@ -1475,15 +1549,24 @@ window.__ModuleLoader__.load({
             connectRequested.current = false
             collapseLocalSidebar()
             /**
-             * 远端 ssh 子进程的输出（含远端 dsh 自己的 stderr，例如
-             * `[deepseek-account] sign-in failed { errorCode }`）只存在 Host 的连接日志里。
-             * 这里把变化的部分回传到本地诊断文件，便于排查远端登录等深水区问题。
+             * 连接就绪后的轻量状态同步（每 3 秒）：
+             * 1. 把远端 ssh 输出（含远端 dsh 自己的 stderr）变化回传到诊断文件；
+             * 2. 跟踪隧道状态，断线自动重连期间给用户明确提示（远端任务不受影响）；
+             * 3. 本地端口万一变了，同步新的远端 URL，避免页面停留在旧地址上。
              */
-            const reportRemoteLog = async () => {
+            const syncLiveState = async () => {
               try {
                 const payload = await getState()
                 if (disposed) return
                 const connection = (payload.active || {})[hostId] || null
+                setLinkStatus(connection ? connection.status : 'disconnected')
+                if (connection && connection.status === 'connected' && connection.url) {
+                  setTarget((previous) => {
+                    if (previous === null || previous.url === connection.url) return previous
+                    const host = (payload.hosts || []).find((item) => item.id === hostId) || previous.host
+                    return { host, url: connection.url }
+                  })
+                }
                 const lines = connection && Array.isArray(connection.log) ? connection.log : []
                 if (lines.length === 0) return
                 const last = lines[lines.length - 1]
@@ -1493,7 +1576,7 @@ window.__ModuleLoader__.load({
                   report: { hostId, kind: 'remote-log', lines: lines.slice(-40) },
                 })
               } catch {
-                // 诊断用途；失败忽略。
+                // 诊断与状态提示用途；失败忽略。
               }
             }
             const poll = async () => {
@@ -1514,11 +1597,12 @@ window.__ModuleLoader__.load({
                 if (connection && connection.status === 'connected' && connection.url) {
                   autoOpenedConnections.add(`${hostId}|${connection.startedAt || ''}`)
                   setTarget({ host, url: connection.url })
+                  setLinkStatus('connected')
                   setPhase('ready')
-                  void reportRemoteLog()
+                  void syncLiveState()
                   if (logTimer === null) {
                     logTimer = setInterval(() => {
-                      void reportRemoteLog()
+                      void syncLiveState()
                     }, 3000)
                   }
                   return
@@ -1627,6 +1711,7 @@ window.__ModuleLoader__.load({
                 keepRunning,
                 keepBusy,
                 onEnableKeepRunning: enableKeepRunning,
+                linkStatus,
                 onOpenExternal: () => {
                   void openExternalUrl(target.url)
                 },

@@ -59,6 +59,8 @@ const SSH_CONNECT_OPTIONS = [
   '-o', 'StrictHostKeyChecking=accept-new',
   '-o', 'ServerAliveInterval=15',
   '-o', 'ServerAliveCountMax=3',
+  // TCP 层保活：让链路中间设备看到持续流量，减少长连接被静默回收/重置。
+  '-o', 'TCPKeepAlive=yes',
 ]
 
 /** SSH 测试用的精简参数（SPEC 固定值）。 */
