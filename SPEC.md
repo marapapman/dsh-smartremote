@@ -658,6 +658,27 @@ const timer = setTimeout(() => { log('步骤超时'); kill(child); finish(null) 
 说明：v0.10.3/v0.10.4 的孤儿进程清理与单飞尝试仍然有效（更硬的加固），但「状态反复
 切换」的另一半原因是这些日志误导；真实重连只应由 `code 255` 触发。
 
+### v0.10.6 — 远端页面周期性重连的根因（远端账号令牌失效）
+
+现象：远端页面每 10–20 秒报 `[connection] connection lost, retry #1`，界面像在反复重连。
+
+取证：
+
+- 远端 `dsh` 进程稳定、`/?token=…` 返回 303（1–2 ms）、无 OOM、远端日志无网关/流错误；
+- 自建独立隧道 + 真实 WebSocket 握手（自动回 Pong，服务端每 ~1.5 s Ping、错过 2 次
+  `terminate()`），连接持续 5 分钟以上不断 —— 排除隧道与网络；
+- 远端账号令牌自测：`/auth-api/v0/users/current` → **403**、`api.deepseek.com/models` → 401；
+  远端 `remote-desktop-web.log` 里该接口持续报错（累计 966 次）。
+
+根因：远端保存的 DeepSeek 账号令牌失效；客户端把 **Remote 流报错**视为连接失效
+（`client-connection` 的 generation 语义），于是页面周期性重建连接。
+
+处理：备份后从远端 `~/.dsh/.credentials.yaml` 删除 `deepseek-account-platform/default` 记录
+（保留 `device`、其它 provider 与顶层 `refs:` 结构），重启远端 dsh；远端默认模型是
+`omp/deepseek-v4.1-flash`，不依赖该账号，对话不受影响。要恢复账号就重新走登录流程。
+另加 `kind:"ws"` 诊断（webview 内包装 `WebSocket`，记录 close code/reason/存活时长），
+以后再遇到可直接区分「网络断开（1006）」与「对端主动关闭（1000/4xxx）」。
+
 
 
 

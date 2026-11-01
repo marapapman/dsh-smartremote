@@ -338,6 +338,14 @@ SSH 隧道与远端界面需要真实服务器联调：添加一台能免密 SSH
   `[setup] 步骤超时`，看起来像一直在重连）。排查要点：真正断链只会以
   `code 255` / `Connection reset` 开头，并伴随 `[reconnect]`；若只有 `[setup] 步骤超时`
   而没有 `[reconnect]`，那是旧版本的日志假象（≥0.10.5 不会再有）。
+- **远端页面每 10–20 秒反复重连（`[connection] connection lost, retry #1`）**：先查远端
+  DeepSeek 账号令牌是否失效。DSH 客户端把「Remote 流报错」当作连接失效，远端账号读接口
+  一直 403 时，页面就会周期性重建连接（看起来像网络抖动，其实是远端配置问题）。
+  核对方法（远端执行）：`grep -c 'status: 403' ~/.dsh/remote-desktop-web.log`；
+  该文件里持续出现 `[deepseek-account] request failed … /auth-api/v0/users/current` 即中招。
+  处理：在远端页面点「登录」重新授权（插件会把授权页开到你本地浏览器）；不需要账号模型时，
+  也可以移除远端 `~/.dsh/.credentials.yaml` 里的 `deepseek-account-platform/default` 记录后
+  重启远端 dsh（先备份该文件；注意保留顶层 `records:` 与 `refs:` 结构）。
 - **频繁断线重连 / 远端 GUI 反复刷新**：先看 `~/.dsh/remote-desktop-ssh.log`。如果出现
   `Connection reset by <服务器> port 22` 或 `client_loop: send disconnect`，通常是本机
   网络或电源管理导致的（Windows「现代待机」会断开网卡），不是服务器踢人也不是插件出错。
