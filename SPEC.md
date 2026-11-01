@@ -636,6 +636,28 @@ v0.10.3 修复后仍能观察到同一时段交叠的 `[setup] 步骤超时`，�
 验证：host 70/70、client 15/15、detached 22/22；日志里每次连接都以
 `[connect] 第 N 次连接尝试（…）` 开头，正常不会有两条尝试同时在飞。
 
+### v0.10.5 — 修复 `runRemoteStep` 的「幽灵步骤超时」
+
+v0.10.4 之后日志仍显示「`[ready]` 之后还不断出现 `[setup] 步骤超时（约 25/75 秒）`」，
+据此一度判断为仍有并发连接。实际根因是 `runRemoteStep` 的 **`finish()` 没有清理超时
+定时器**：
+
+```js
+const timer = setTimeout(() => { log('步骤超时'); kill(child); finish(null) }, timeoutMs)
+// finish() 只 resolve，没有 clearTimeout(timer)
+```
+
+远端步骤（`ensureRemoteDsh` 25s、`prepareDetachedRemoteDsh` 75s）通常 1–2 秒就成功返回，
+但它们的定时器仍在运行，到点后照样打印「步骤超时」（并对已退出的子进程调用 kill，无害）。
+于是日志里出现「成功步骤的幽灵超时行」，与真实连接状态无关；每次连接都会留下 1–2 条，
+拼接起来就像「一直在超时/重连」。
+
+修复：`finish()` 中 `clearTimeout(timer)`，定时器回调内再判一次 `settled`；`[ready]`
+日志追加连接尝试编号，方便区分「多次尝试」与「一次成功 + 幽灵行」。
+
+说明：v0.10.3/v0.10.4 的孤儿进程清理与单飞尝试仍然有效（更硬的加固），但「状态反复
+切换」的另一半原因是这些日志误导；真实重连只应由 `code 255` 触发。
+
 
 
 

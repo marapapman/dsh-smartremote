@@ -693,9 +693,16 @@ function runRemoteStep(conn, sshPath, args, timeoutMs) {
     let settled = false
     let output = ''
     let child = null
+    let timer = null
     const finish = (code) => {
       if (settled) return
       settled = true
+      // 成功/失败都要清掉超时定时器：否则步骤早已完成，定时器仍会在 25s/75s 后
+      // 打印「步骤超时」，让人误以为连接在反复失败（曾据此误判过重连抖动）。
+      if (timer !== null) {
+        clearTimeout(timer)
+        timer = null
+      }
       if (child && conn.child === child) conn.child = null
       resolve({ code, stdout: output })
     }
@@ -726,7 +733,9 @@ function runRemoteStep(conn, sshPath, args, timeoutMs) {
       flushLineBuffer(conn)
       finish(typeof code === 'number' ? code : null)
     })
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
+      timer = null
+      if (settled) return
       appendLogLine(conn, `[setup] 步骤超时（约 ${Math.round(timeoutMs / 1000)} 秒）`)
       killProcessTree(child)
       finish(null)
@@ -1297,7 +1306,10 @@ function markConnected(conn) {
   conn.error = null
   conn.reconnectAttempt = 0
   conn.url = buildConnectionUrl(conn.localPort, conn.token)
-  appendLogLine(conn, `[ready] 本地端口转发已就绪：127.0.0.1:${conn.localPort}`)
+  appendLogLine(
+    conn,
+    `[ready] 本地端口转发已就绪：127.0.0.1:${conn.localPort}（连接尝试 ${conn.attempt || 1}）`,
+  )
 }
 
 /** 置为 error 并清理进程；已经断开/就绪时忽略迟到的失败回调。 */
