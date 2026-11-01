@@ -1198,6 +1198,51 @@ window.__ModuleLoader__.load({
                         };
                       }
                     } catch (e) {}
+                    // WebSocket 诊断：记录每次 WS 的存活时长、关闭码与原因，用于判断
+                    // 「隧道/网络断开」还是「远端主动关闭」（码 1006 vs 1000/4xxx）。
+                    try {
+                      window.__rdWsEvents = window.__rdWsEvents || [];
+                      if (!window.__rdWsWrapped) {
+                        window.__rdWsWrapped = true;
+                        const OrigWS = window.WebSocket;
+                        if (typeof OrigWS === "function") {
+                          const push = (rec) => {
+                            try {
+                              window.__rdWsEvents.push(rec);
+                              if (window.__rdWsEvents.length > 20) window.__rdWsEvents.shift();
+                            } catch (e) {}
+                          };
+                          const Wrapped = function (url, protocols) {
+                            const ws = protocols === undefined ? new OrigWS(url) : new OrigWS(url, protocols);
+                            const startedAt = Date.now();
+                            const rec = { url: String(url || ""), opened: false, lived: null, code: null, reason: "", clean: null, error: false };
+                            try {
+                              ws.addEventListener("open", function () { rec.opened = true; });
+                              ws.addEventListener("close", function (ev) {
+                                rec.lived = Date.now() - startedAt;
+                                rec.code = ev && ev.code;
+                                rec.reason = String((ev && ev.reason) || "").slice(0, 120);
+                                rec.clean = ev && ev.wasClean;
+                                push(rec);
+                              });
+                              ws.addEventListener("error", function () {
+                                rec.error = true;
+                                if (rec.lived === null) {
+                                  rec.lived = Date.now() - startedAt;
+                                  push(rec);
+                                }
+                              });
+                            } catch (e) {}
+                            return ws;
+                          };
+                          Wrapped.prototype = OrigWS.prototype;
+                          ["CONNECTING", "OPEN", "CLOSING", "CLOSED"].forEach(function (key) {
+                            try { Object.defineProperty(Wrapped, key, { value: OrigWS[key] }); } catch (e) {}
+                          });
+                          window.WebSocket = Wrapped;
+                        }
+                      }
+                    } catch (e) {}
                     document.addEventListener("click", function (event) {
                       try {
                         const node = event.target;
@@ -1247,7 +1292,8 @@ window.__ModuleLoader__.load({
                   const via = window.__rdLoginVia;
                   window.__rdLoginUrl = "";
                   window.__rdLoginVia = "";
-                  return JSON.stringify({ url: String(url || ""), via: String(via || "") });
+                  const ws = Array.isArray(window.__rdWsEvents) ? window.__rdWsEvents.splice(0) : [];
+                  return JSON.stringify({ url: String(url || ""), via: String(via || ""), ws: ws });
                 })()`
                 const pollLoginLink = async () => {
                   try {
@@ -1255,12 +1301,20 @@ window.__ModuleLoader__.load({
                     if (disposed || !raw) return
                     let candidate = raw
                     let via = ''
+                    let wsEvents = []
                     try {
                       const parsed = JSON.parse(raw)
                       candidate = String((parsed && parsed.url) || '')
                       via = String((parsed && parsed.via) || '')
+                      wsEvents = Array.isArray(parsed && parsed.ws) ? parsed.ws : []
                     } catch {
                       // 兼容旧格式：直接返回 URL 字符串。
+                    }
+                    // WebSocket 诊断：把关闭码/原因回传，用于区分网络断开与远端主动关闭。
+                    if (wsEvents.length > 0) {
+                      void postJson('/client-report', {
+                        report: { hostId, url, kind: 'ws', events: wsEvents.slice(0, 20) },
+                      }).catch?.(() => {})
                     }
                     if (!/^https?:\/\//i.test(candidate)) return
                     setLoginUrl(candidate)
