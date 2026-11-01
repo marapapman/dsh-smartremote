@@ -1207,6 +1207,9 @@ function createConnection(host) {
     // 意外断链自动重连（仅保持远端运行）：已重试次数与定时器。
     reconnectAttempt: 0,
     reconnectTimer: null,
+    // 连接尝试编号与在飞尝试；同一主机任何时刻只允许一个连接尝试，重复请求合并。
+    attempt: 0,
+    attemptPromise: null,
     // 用户主动断开/重启时置位，避免自动重连把它拉回来。
     userStopped: false,
   }
@@ -1322,12 +1325,43 @@ function buildConnectTimeoutMessage(conn) {
 }
 
 /** 启动后按 SPEC 参数拉起 ssh，并挂上输出/退出/超时处理。 */
+/**
+ * 单飞连接尝试：同一主机任何时刻只允许一个连接尝试在飞。
+ * 重复请求（客户端 /connect、自动重连、重启后重建）直接复用现有尝试，
+ * 不会各自 spawn 一份 ssh —— 那正是此前「连上又断开」抖动的根源。
+ */
+function startAttempt(conn, options = {}) {
+  if (conn.attemptPromise !== null) return conn.attemptPromise
+  const attempt = (conn.attempt || 0) + 1
+  conn.attempt = attempt
+  const reason = typeof options.reason === 'string' && options.reason ? options.reason : 'connect'
+  appendLogLine(conn, `[connect] 第 ${attempt} 次连接尝试（${reason}）`)
+  const promise = beginSshConnection(conn, { ...options, attempt })
+    .catch((error) => {
+      if (conn.attempt === attempt) failConnection(conn, `建立 SSH 连接失败：${toMessage(error)}`)
+    })
+    .finally(() => {
+      if (conn.attempt === attempt) conn.attemptPromise = null
+    })
+  conn.attemptPromise = promise
+  return promise
+}
+
+/** 作废当前连接尝试（旧尝试的后续步骤会因 attempt 不匹配而自行退出）。 */
+function supersedeAttempt(conn) {
+  if (!conn) return
+  conn.attempt = (conn.attempt || 0) + 1
+  conn.attemptPromise = null
+}
+
 async function beginSshConnection(conn, options = {}) {
+  const myAttempt = typeof options.attempt === 'number' ? options.attempt : conn.attempt
+  const superseded = () => conn.attempt !== myAttempt
   const preferredLocalPort = typeof options.preferredLocalPort === 'number' ? options.preferredLocalPort : null
   const skipDshCheck = options.skipDshCheck === true
   try {
     const ssh = await resolveSsh()
-    if (conn.status !== 'connecting') return
+    if (superseded() || conn.status !== 'connecting') return
     if (!ssh.available) {
       failConnection(conn, SSH_MISSING_MESSAGE)
       return
@@ -1337,20 +1371,21 @@ async function beginSshConnection(conn, options = {}) {
     if (conn.host.mode === 'launch') {
       if (!skipDshCheck) {
         const ready = await ensureRemoteDsh(conn, ssh.path)
-        if (!ready || conn.status !== 'connecting') return
+        if (superseded() || !ready || conn.status !== 'connecting') return
       }
       if (isDetachedLaunch(conn.host)) {
         // 保持远端运行：远端进程常驻（缺省复用上一次的），这里只准备令牌与端口。
         const prepared = await prepareDetachedRemoteDsh(conn, ssh.path)
-        if (!prepared || conn.status !== 'connecting') return
+        if (superseded() || !prepared || conn.status !== 'connecting') return
       } else {
         // 上一次连接可能留下/残留占用远端端口：清理残留或换一个空闲端口。
         const prepared = await prepareRemotePort(conn, ssh.path)
-        if (!prepared || conn.status !== 'connecting') return
+        if (superseded() || !prepared || conn.status !== 'connecting') return
       }
     }
 
     const localPort = await allocateLocalPortPreferring(preferredLocalPort)
+    if (superseded()) return
     if (localPort === null) {
       failConnection(conn, '无法分配本地端口（可能是本机端口耗尽）。')
       return
@@ -1364,6 +1399,10 @@ async function beginSshConnection(conn, options = {}) {
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
+    if (superseded()) {
+      killProcessTree(child)
+      return
+    }
     trackChild(conn, child)
     child.stdout?.setEncoding('utf8')
     child.stderr?.setEncoding('utf8')
@@ -1473,9 +1512,7 @@ function retryConnection(conn) {
   conn.error = null
   conn.url = null
   conn.token = null
-  beginSshConnection(conn, { preferredLocalPort: preferred, skipDshCheck: true }).catch((error) => {
-    if (conn.status === 'connecting') failConnection(conn, `自动重连失败：${toMessage(error)}`)
-  })
+  startAttempt(conn, { preferredLocalPort: preferred, skipDshCheck: true, reason: 'auto-reconnect' })
 }
 
 /** 开始探活：launch 需要先拿到 token，attach 立即探测。 */
@@ -1534,6 +1571,7 @@ function startConnection(host) {
   const stale = connections.get(host.id) ?? null
   if (stale !== null) {
     stale.userStopped = true
+    supersedeAttempt(stale)
     clearConnectionTimers(stale)
     terminateChild(stale)
   }
@@ -1546,9 +1584,7 @@ function startConnection(host) {
     return
   }
   // beginSshConnection 内部已兜底错误，这里再挂一次 catch 以防未捕获 rejection。
-  beginSshConnection(record).catch((error) => {
-    failConnection(record, `建立 SSH 连接失败：${toMessage(error)}`)
-  })
+  startAttempt(record, { reason: 'initial' })
 }
 
 /** 主动断开：kill 进程并把视图置为 disconnected（保留日志）。 */
@@ -1556,6 +1592,7 @@ function disconnectHost(id, reason = '已断开连接') {
   const conn = connections.get(id)
   if (!conn) return
   conn.userStopped = true
+  supersedeAttempt(conn)
   clearConnectionTimers(conn)
   terminateChild(conn)
   flushLineBuffer(conn)
@@ -1572,6 +1609,7 @@ function disconnectHost(id, reason = '已断开连接') {
 function disconnectAllConnections() {
   for (const conn of connections.values()) {
     conn.userStopped = true
+    supersedeAttempt(conn)
     clearConnectionTimers(conn)
     terminateChild(conn)
     flushLineBuffer(conn)
@@ -2324,9 +2362,7 @@ async function connectHost(rawId) {
     current.url = null
     current.token = null
     appendLogLine(current, '[reconnect] 收到手动重连请求')
-    beginSshConnection(current, { preferredLocalPort: current.localPort }).catch((error) => {
-      if (current.status === 'connecting') failConnection(current, `建立 SSH 连接失败：${toMessage(error)}`)
-    })
+    startAttempt(current, { preferredLocalPort: current.localPort, reason: 'manual' })
     return { ok: true }
   }
   startConnection(host)
@@ -2359,6 +2395,7 @@ async function restartHost(rawId) {
 
   if (conn !== null) {
     conn.userStopped = true
+    supersedeAttempt(conn)
     clearConnectionTimers(conn)
     terminateChild(conn)
     flushLineBuffer(conn)

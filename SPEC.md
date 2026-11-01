@@ -614,6 +614,28 @@ v0.10.0 之前保存的旧记录（没有 `keepRemoteRunning` 字段），因此
 验证：`test/host-smoke.mjs` 70/70、`test/client-smoke.mjs` 15/15、
 `test/detached-smoke.mjs` 22/22；修复后日志不再出现同一时段交叠的 setup 步骤。
 
+### v0.10.4 — 单飞连接尝试（彻底消除并发连接）
+
+v0.10.3 修复后仍能观察到同一时段交叠的 `[setup] 步骤超时`，说明还有第二个入口在发起
+连接：客户端 `/connect`（面板重挂载/点图标）、自动重连、重启后重建都可能触发
+`beginSshConnection`，而它们之间只有「状态检查」这一层软约束——`beginSshConnection`
+返回后状态仍是 `connecting`，但任何一次失败/超时都会把状态改回 `error`，让另一个入口
+紧接着再起一份连接，于是表现为状态反复抖动。
+
+修复：引入**连接尝试（attempt）**：
+
+1. 每条连接记录带 `attempt`（编号）与 `attemptPromise`（在飞尝试）；
+   `startAttempt(conn, options)` 是唯一入口：有在飞尝试则直接复用，否则编号 +1 并启动，
+   在日志里打印 `[connect] 第 N 次连接尝试（initial/manual/auto-reconnect）`。
+2. `beginSshConnection` 在每个 `await` 之后检查 `superseded()`（`conn.attempt` 是否已变），
+   被作废的旧尝试在任意阶段自行退出，不会继续 spawn ssh 或改状态。
+3. 主动断开/重启/新建记录时调用 `supersedeAttempt(conn)` 作废在飞尝试，并清掉定时器与子进程。
+4. 客户端提示条加抖动抑制：连续两次 3 秒轮询都非 `connected` 才显示「正在自动重连」，
+   避免几秒级中断让界面闪。
+
+验证：host 70/70、client 15/15、detached 22/22；日志里每次连接都以
+`[connect] 第 N 次连接尝试（…）` 开头，正常不会有两条尝试同时在飞。
+
 
 
 

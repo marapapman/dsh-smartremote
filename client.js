@@ -1546,6 +1546,7 @@ window.__ModuleLoader__.load({
             let timer = null
             let logTimer = null
             let lastReportedLogLine = ''
+            let offlineTicks = 0
             connectRequested.current = false
             collapseLocalSidebar()
             /**
@@ -1559,7 +1560,14 @@ window.__ModuleLoader__.load({
                 const payload = await getState()
                 if (disposed) return
                 const connection = (payload.active || {})[hostId] || null
-                setLinkStatus(connection ? connection.status : 'disconnected')
+                // 抖动抑制：连续两次轮询都非 connected 才显示提示条，避免几秒级中断让界面闪。
+                if (connection && connection.status === 'connected') {
+                  offlineTicks = 0
+                  setLinkStatus('connected')
+                } else {
+                  offlineTicks += 1
+                  setLinkStatus(offlineTicks >= 2 && connection ? connection.status : 'connected')
+                }
                 if (connection && connection.status === 'connected' && connection.url) {
                   setTarget((previous) => {
                     if (previous === null || previous.url === connection.url) return previous
