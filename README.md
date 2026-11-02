@@ -19,14 +19,15 @@ remote server from the local desktop app.
 - Clicking it opens an SSH tunnel, launches (or attaches to) `dsh web` on the server,
   and takes over the central area with a **toolbar-less Electron `<webview>`** that
   hosts the remote UI (first-party cookie partition, so the remote session works).
-- **First connect auto-installs** `dsh` on the server when missing
-  (configurable command, default `npm install -g @deepseek-ai/dsh`).
-- Port self-healing: leftover remote `dsh` processes are cleaned up, a free remote
-  port is chosen when needed, and failures surface the real SSH output.
+- **Zero-config connect (no mode picker)**: on connect the plugin probes the server —
+  no `dsh` means it is started detached (auto-installed first when missing); an
+  already running `dsh` is reused as-is, so the previous task keeps running.
+- **The remote dsh always runs detached** from the SSH session: 返回 / 断开, host sleep,
+  network loss or closing the app never interrupt remote work; a dropped tunnel
+  reconnects automatically. Only **停止远端 / 重启远端** end the remote process.
 - **SSH config discovery**: import hosts from `~/.ssh/config` and `~/.ssh/known_hosts`.
 - **Remote DeepSeek sign-in is forwarded to your local default browser**; the OAuth
   callback returns through the SSH tunnel to the remote host.
-- Three modes: launch remote dsh over SSH, attach to a running dsh, or open a plain URL.
 
 Requirements: DSH Desktop, an OpenSSH client with non-interactive key auth
 (`BatchMode=yes`; use ssh-agent for passphrase keys), and Node.js + `dsh` on the server
@@ -48,22 +49,19 @@ Install (see [安装](#安装) for all three ways):
   发现」在二级页面里。
 - **每配置好一台远程主机，左侧栏就多一个以主机名命名的图标**；点它自动连接并接管
   窗口。远端视图顶部的「返回」回到**本地桌面界面（会话）**，不是配置页。
-- **SSH 启动远端 dsh**：面板自动通过 SSH 在服务器上运行
-  `dsh --profile web --port 39080 --no-open`，从启动输出里解析访问令牌，建立
-  `127.0.0.1:<本地端口> → 127.0.0.1:39080` 的加密端口转发，然后用远端界面接管窗口。
-- **断开后保持远端运行（默认开启）**：远端 dsh 会 `setsid` 脱离 SSH 会话在后台常驻。
-  点「返回」「断开」、**本机睡眠**、断网甚至**关掉本机应用**，远端正在执行的任务都会继续；
-  隧道断开后插件会按退避自动重连（沿用同一本地端口，远端页面自己接回去，任务与界面都不中断），
-  下次连接自动复用同一个进程（令牌与日志都在远端 `~/.dsh/remote-desktop-web.log`）。
-  可在主机配置里关闭（关闭后远端 dsh 随 SSH 会话结束而终止）。
-- **手动重启远端**：远端视图顶栏有「重启远端」按钮，强制结束远端 dsh 并重新拉起
-  （连接失败页也有），用于远端卡死或想清空远端状态时。
-- **首次连接自动安装 dsh**：连接前先探测远端有没有 `dsh`；没有就自动执行可配置的
-  安装命令（默认 `npm install -g @deepseek-ai/dsh`），安装输出实时显示在连接界面上，
-  完成后继续启动。需要远端有 npm/Node.js 与网络。
-- **SSH 连接已运行的 dsh**：远端已经手动跑着 dsh web 时，只做端口转发，填一下远端
-  打印的访问令牌即可。
-- **直接 URL**：远端已经有反向代理/公网地址时，直接打开完整 URL。
+- **连接即自动探测（没有模式选择）**：点主机图标后插件先探测远端——没有 `dsh` 就用
+  `setsid nohup` 在后台常驻启动（先确认已安装，缺失时自动
+  `npm install -g @deepseek-ai/dsh`），已经有 `dsh` 就直接接入同一个进程；随后建立
+  `127.0.0.1:<本地端口> → 127.0.0.1:<远端端口>` 的加密端口转发，用远端界面接管窗口。
+- **远端永远常驻，本地怎么退都不影响它**：远端 dsh 脱离 SSH 会话运行（日志
+  `~/.dsh/remote-desktop-web.log`）。点「返回」「断开」、**本机睡眠**、断网甚至
+  **关掉本机应用**，远端正在执行的任务都会继续；隧道断了按
+  `1.5s/3s/5s/8s/13s/21s` 退避自动重连并沿用同一本地端口，远端页面自己接回原地址。
+- **只有两个按钮会结束远端进程**：「重启远端」强制结束并重新拉起（远端卡死/想清空
+  状态时用）；「停止远端」（二次确认）结束远端 dsh——这是唯一让远端任务停止的方式。
+- **首次连接自动安装 dsh**：连接前先探测远端有没有 `dsh`；没有就自动执行
+  `npm install -g @deepseek-ai/dsh`，安装输出实时显示在连接界面上，完成后继续启动。
+  需要远端有 npm/Node.js 与网络。
 
 ## 安装
 
@@ -160,13 +158,12 @@ dsh plugin --profile desktop add /Users/me/src/dsh-smartremote
    `ssh 用户名@服务器` 能免交互登录）。插件以 `BatchMode=yes` 运行，不会弹交互式
    密码/私钥口令输入；私钥有口令的请先启动 ssh-agent 并 `ssh-add`。
 3. 服务器上已安装 `dsh` 命令，且非交互 SSH 会话的 PATH 能找到它；没装也没关系——
-   首次连接会自动运行「自动安装命令」（默认 `npm install -g @deepseek-ai/dsh`，
-   需要远端有 npm 与网络；可在设置里改成绝对路径/镜像源等）。
+   首次连接会自动执行 `npm install -g @deepseek-ai/dsh`（需要远端有 npm 与网络）。
 
 ## 自动发现本机 SSH 配置
 
 打开面板时会自动读取本机的 SSH 客户端配置，把「还没导入」的服务器列成候选，点「导入」
-即可生成连接配置（默认用 SSH 启动远端 dsh 模式，远端端口 39080），不用手抄
+即可生成连接配置（远端端口默认 39080），不用手抄
 host / user / port / 私钥路径。
 
 读取来源：
@@ -189,45 +186,38 @@ host / user / port / 私钥路径。
 
 1. **配置全部在 设置 → 远程主机**：页面是一个简洁的主机列表，可添加多台；
    「添加远程主机」进入二级表单，「从本机 SSH 配置发现」进入二级候选页。
-   二级表单字段（三种模式）：
-   - SSH 启动远端 dsh：SSH 主机、端口（默认 22）、用户名、私钥路径（留空用默认
-     `~/.ssh/id_*` 或 ssh-agent）、远端端口（默认 39080），以及可选的
-     **「断开后保持远端运行」**开关（见下）。
-   - SSH 连接已运行 dsh：同上，另填远端 `dsh web:` 启动行里的 `token=...`。
-   - 直接 URL：填完整地址（如 `https://dsh.example.com/?token=...`）。
+   二级表单只有 SSH 目标本身：SSH 主机、端口（默认 22）、用户名、私钥路径
+   （留空用默认 `~/.ssh/id_*` 或 ssh-agent）、远端端口（默认 39080）。
    保存后可在编辑页点「测试」确认 SSH 能连通。
 2. **使用**：每保存一台主机，左侧栏就出现一个**以主机名命名的图标**。点该图标：
-   自动连接并把远端界面铺满中央区域（**无地址栏**），本地左侧栏自动收起。
-3. 远端视图顶部有 `返回`、主机名、`重新加载`、`重启远端`、`断开`。点
+   自动探测/启动远端 dsh 并连接，把远端界面铺满中央区域（**无地址栏**），
+   本地左侧栏自动收起。
+3. 远端视图顶部有 `返回`、主机名、`重新加载`、`重启远端`、`停止远端`、`断开`。点
    **「返回」回到本地桌面界面（会话）**，不会停在配置页；本地左侧栏同时恢复。
 
-### 断开后保持远端运行
-
-**默认开启**（主机配置里的「断开后保持远端运行」，可手动关闭）：
+### 远端常驻与断线重连（无需配置）
 
 - 远端 dsh 用 `setsid nohup` 启动，**脱离 SSH 会话**（远端日志
   `~/.dsh/remote-desktop-web.log`），所以点「返回」「断开」、**本机睡眠**、断网、关掉桌面
-  应用都不影响它；
+  应用都不影响它；本地只保留一条 `ssh -N` 端口转发隧道；
 - 远端正在跑的 agent 任务继续执行；隧道意外断开时插件按 `1.5s/3s/5s/8s/13s/21s` 退避
   自动重连（最多 6 次），并**沿用同一本地端口**，所以远端页面自带的重连能接回原地址，
   任务进度与界面都不丢；
-- 下次点主机图标会**复用同一个进程**（令牌自动从远端日志读回），不会重启；
-- 此时远端端口固定为配置的「远端端口」，不自动换端口；若被别的进程占用会明确报错；
-- 关闭该开关后恢复旧行为：远端 dsh 随 SSH 会话一起结束；
-- 想让它停下来：点远端视图里的 **「重启远端」**（强制结束并重新拉起），或到服务器上
+- 下次点主机图标时插件会先探测：端口上已有本插件启动的 dsh 就**复用同一个进程**
+  （令牌自动从远端日志读回），不会重启；没有才重新启动；
+- 远端端口固定为配置的「远端端口」，不自动换端口；若被别的进程占用会明确报错；
+- **让它停下来**：点远端视图顶栏的 **「停止远端」**（二次确认，唯一会结束远端任务的
+  操作），或 **「重启远端」**（结束并重新拉起），也可以到服务器上
   `pkill -f "dsh --profile web"`。
-
-> 远端视图顶部如果显示「当前未开启『断开后保持远端运行』」提示条，点右侧
-> 「开启并重启远端」即可一键切换（会重启远端一次）。
 
 ### 连接健壮性
 
-- 连接前会检查远端端口：如果上一次连接残留的 dsh 还占着端口，会先清理它；仍被别的
-  进程占用时自动换一个空闲端口（日志里会有 `[setup]` 提示）。开启「保持远端运行」时
-  改为固定端口 + 复用，不做清理。
-- 断开或启动失败时会尽力清理远端 dsh，避免残留阻塞下一次连接（保持远端运行时不做清理）。
-- 隧道意外断开（睡眠、断网、Wi-Fi 切换）时，保持远端运行的主机会自动退避重连并复用原
-  本地端口，远端任务不中断；重连日志里会看到 `[reconnect] …`。
+- 连接前会检查远端端口：如果端口上已有一个 dsh 就复用（任务不中断）；端口空闲就后台
+  启动；被别的进程占用则明确报错，提示换「远端端口」或先结束那个进程（日志里是
+  `[setup] 后台启动失败（port-busy）`）。
+- 「断开」只拆本地隧道，**绝不结束远端 dsh**；启动失败时才会回收本次新起的进程。
+- 隧道意外断开（睡眠、断网、Wi-Fi 切换）时会自动退避重连并复用原本地端口，远端任务
+  不中断；重连日志里会看到 `[reconnect] …`。
 - **远端视图打开期间会阻止本机空闲休眠**（申请屏幕唤醒锁，只在本机页面可见时持有）：
   Windows 现代待机会断开网卡，是「频繁断线重连」的常见原因。离开远端视图即释放，不影响
   正常待机。远端视图顶部在断线期间会显示「正在自动重连」提示，不会让人误以为程序出错。
@@ -271,8 +261,8 @@ Strict cookie，远端页面会显示 “dsh web authentication required”。
 - webview 的 cookie 不跨应用重启保留：重启后重新点「连接」会自动重新接管并登录。
 - 远端和本地 dsh 版本不一致时，界面以远端版本为准，个别新面板可能缺失。
 - 首次连接会 `accept-new` 记录服务器主机密钥（写入系统 known_hosts）。
-- 「断开后保持远端运行」要求远端有 `setsid`（util-linux，主流发行版默认有）；没有时自动
-  退回 `nohup`。保活期间端口固定、远端日志会持续增长（超过 2 MB 自动轮转为 `.log.1`）。
+- 远端常驻要求服务器有 `setsid`（util-linux，主流发行版默认有）；没有时自动退回
+  `nohup`。远端日志会持续增长（超过 2 MB 自动轮转为 `.log.1`）。
 
 ## 开发与自测
 
@@ -283,7 +273,7 @@ Strict cookie，远端页面会显示 “dsh web authentication required”。
 # Host 半冒烟测试（假 ctx + 真实 HTTP，隔离 DSH_HOME，不触网/不启动 ssh）
 node test/host-smoke.mjs
 
-# 「保持远端运行」与「重启远端」的纯函数测试（argv 与远端脚本约束）
+# 「自动探测+常驻启动」与「停止/重启远端」的纯函数测试（argv 与远端脚本约束）
 node test/detached-smoke.mjs
 
 # Client 半冒烟测试（模块加载、槽位注册、中英文字典键对齐）
@@ -302,11 +292,14 @@ SSH 隧道与远端界面需要真实服务器联调：添加一台能免密 SSH
 - 面板里展开连接日志看 SSH/dsh 输出；也可在终端手动复现：
 
   ```sh
-  ssh -o BatchMode=yes -p 22 -L 127.0.0.1:40123:127.0.0.1:39080 user@server \
-      "dsh --profile web --port 39080 --no-open"
+  # 远端起一个常驻 dsh（插件也是这么做的）
+  ssh -p 22 user@server 'setsid nohup sh -c "dsh --profile web --port 39080 --no-open" \
+      >> ~/.dsh/remote-desktop-web.log 2>&1 < /dev/null &'
+  # 本地只建隧道
+  ssh -N -o BatchMode=yes -p 22 -L 127.0.0.1:40123:127.0.0.1:39080 user@server
   ```
 
-  看到 `dsh web: http://127.0.0.1:39080/?token=...` 后，本地打开
+  看到远端日志里的 `dsh web: http://127.0.0.1:39080/?token=...` 后，本地打开
   `http://127.0.0.1:40123/?token=...` 应能进入远端界面。
 - 远端页面提示 `dsh web authentication required`：说明页面没拿到远端会话 cookie。
   用「在桌面中打开」（右侧 Browser 面板，第一方 webview）或「在浏览器打开」，
@@ -326,11 +319,12 @@ SSH 隧道与远端界面需要真实服务器联调：添加一台能免密 SSH
   （`https://api.deepseek.com/models` 正常；日志里会反复出现
   `[deepseek-account] request failed … status: 403`）。
 - `Permission denied`：确认公钥已装到服务器 `~/.ssh/authorized_keys`，或私钥路径正确。
-- `command not found`：在「启动命令」里用 `dsh` 的绝对路径。
-- 远端端口被占用：换一个远端端口（同时改启动命令里的 `--port`）。
-- 「保持远端运行」下连接报 `远端端口 39080 上已有一个 dsh，但日志里没有它的访问令牌`：
-  说明该端口上的 dsh 不是本插件启动的（或日志被清掉）。到服务器上结束该进程
-  （`pkill -f "dsh --profile web"`）后重连，或改用「SSH 连接已运行的 dsh」模式手动填令牌。
+- `command not found`：确认 `dsh` 在非交互 SSH 会话的 PATH 里（插件固定用 `dsh` 命令）。
+- 远端端口被占用（日志 `[setup] 后台启动失败（port-busy）`）：换一个「远端端口」，
+  或在服务器上结束占用该端口的进程。
+- 连接报 `远端端口 39080 上已有一个 dsh，但日志里没有它的访问令牌`：说明该端口上的
+  dsh 不是本插件启动的（或远端日志被清掉/轮转过）。到服务器上结束该进程
+  （`pkill -f "dsh --profile web"`）后重连，插件会重新常驻启动一次。
 - 远端卡死、想清空远端状态：点远端视图顶栏「重启远端」；也可以在服务器上执行
   `pkill -f "dsh --profile web"` 后本地点「重新加载」重连。
 - **状态在「连接成功」和「重连中」之间反复切换**：v0.10.3/v0.10.4 修掉了并发连接抖动，

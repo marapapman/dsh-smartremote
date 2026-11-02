@@ -2,14 +2,19 @@
  * Browser half of the Remote Desktop bundle（远程主机 / Remote Desktop）。
  *
  * Registers the left-sidebar entry (`sidebar.panellist`, id `remote-desktop`) and
- * its page (`main`, key `remote-desktop`). The page talks to the Host half's
- * HTTP API under `/remote-desktop/api`:
+ * its page (`main`, key `remote-desktop`). Each host only stores the SSH target:
+ * on connect the Host half probes the remote dsh, starting it detached in the
+ * background when missing or reusing the running process when present, so remote
+ * tasks survive local disconnect. The page talks to the Host half's HTTP API
+ * under `/remote-desktop/api`:
  *
  *   GET  /state            — ssh environment + saved hosts + live connections
  *   POST /hosts            — create (no id) or update (existing id) a host
  *   POST /hosts/delete     — disconnect then delete
  *   POST /connect          — start connecting, returns immediately
- *   POST /disconnect       — stop a live connection
+ *   POST /disconnect       — stop the local tunnel only (remote keeps running)
+ *   POST /restart          — restart the remote dsh process (interrupts tasks)
+ *   POST /stop             — stop the remote dsh process and tear down the tunnel
  *   POST /test             — run a synchronous SSH test
  *   GET  /discover         — local SSH config / known_hosts discovery (once per mount)
  *
@@ -33,10 +38,6 @@ window.__ModuleLoader__.load({
     const POLL_INTERVAL_MS = 2500
     const DEFAULT_SSH_PORT = 22
     const DEFAULT_REMOTE_PORT = 39080
-    const DEFAULT_LAUNCH_COMMAND = 'dsh --profile web --port {port} --no-open'
-    const DEFAULT_INSTALL_COMMAND = 'npm install -g @deepseek-ai/dsh'
-    const MODES = ['launch', 'attach', 'url']
-    const MODE_LABEL_KEYS = { launch: 'modeLaunch', attach: 'modeAttach', url: 'modeUrl' }
     const STATUS_LABEL_KEYS = {
       connecting: 'statusConnecting',
       connected: 'statusConnected',
@@ -51,7 +52,6 @@ window.__ModuleLoader__.load({
     }
     const LOG_TAIL_LINES = 10
     const MAX_NAME_CHARS = 80
-    const MAX_TOKEN_CHARS = 256
 
     /* 已经自动接管过窗口的连接（`<hostId>|<startedAt>`），避免面板重挂载时反复切换。 */
     const autoOpenedConnections = new Set()
@@ -96,21 +96,11 @@ window.__ModuleLoader__.load({
       .rd-hint { margin: 0; font-size: 11.5px; color: var(--dsw-alias-label-secondary); }
       .rd-formFoot { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
       .rd-formError { margin: 0; font-size: 12px; color: var(--dsw-alias-state-error-primary); }
-      .rd-seg { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; align-self: flex-start; padding: 3px; border-radius: 9px; background: var(--dsw-alias-bg-layer-2); }
-      .rd-segBtn { font: inherit; font-size: 12.5px; line-height: 1.2; padding: 6px 12px; border-radius: 7px; border: none; background: transparent; color: var(--dsw-alias-label-secondary); cursor: pointer; }
-      .rd-segBtn:hover { color: var(--dsw-alias-label-primary); }
-      .rd-segBtn.is-active { background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-primary); box-shadow: 0 0 0 1px var(--dsw-alias-border-l1); }
-      .rd-segBtn:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 0; }
-      .rd-segBtn:disabled { opacity: 0.55; cursor: default; }
 
       .rd-empty { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 38px 18px; text-align: center; color: var(--dsw-alias-label-secondary); }
       .rd-emptyIcon { display: inline-flex; color: var(--dsw-alias-state-idle-primary); }
       .rd-empty h2 { margin: 0; font-size: 14px; font-weight: 600; color: var(--dsw-alias-label-primary); }
       .rd-empty p { margin: 0; max-width: 560px; font-size: 12.5px; }
-      .rd-modeGrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; width: 100%; max-width: 820px; margin-top: 6px; }
-      .rd-modeCard { text-align: left; padding: 11px 12px; border-radius: 10px; border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-1); }
-      .rd-modeCard strong { display: block; margin-bottom: 3px; font-size: 12.5px; font-weight: 600; color: var(--dsw-alias-label-primary); }
-      .rd-modeCard span { font-size: 11.5px; color: var(--dsw-alias-label-secondary); }
 
       .rd-discover { display: flex; flex-direction: column; gap: 10px; }
       .rd-discoverHead { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
@@ -188,9 +178,6 @@ window.__ModuleLoader__.load({
       .rd-remoteLoginText { flex: 1 1 auto; min-width: 0; font-size: 12px; line-height: 1.5; color: var(--dsw-alias-label-primary); }
       .rd-remoteInfo { flex: none; display: flex; align-items: flex-start; gap: 8px; padding: 7px 10px; border-top: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-1); }
       .rd-remoteInfoText { flex: 1 1 auto; min-width: 0; font-size: 11.5px; line-height: 1.5; color: var(--dsw-alias-label-secondary); white-space: pre-wrap; word-break: break-word; }
-      .rd-check { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--dsw-alias-label-primary); cursor: pointer; }
-      .rd-check input { width: 14px; height: 14px; margin: 0; flex: none; accent-color: var(--dsw-alias-brand-primary); cursor: pointer; }
-      .rd-check input:disabled { cursor: default; }
       .rd-statusPage { flex: 1 1 auto; min-height: 0; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; }
       .rd-remoteStatusInline { position: static; inset: auto; background: transparent; flex: none; }
 
@@ -211,7 +198,6 @@ window.__ModuleLoader__.load({
 
       @media (max-width: 760px) {
         .rd-formGrid { grid-template-columns: minmax(0, 1fr); }
-        .rd-modeGrid { grid-template-columns: minmax(0, 1fr); }
         .rd-header, .rd-body { padding-left: 18px; padding-right: 18px; }
       }
       @media (prefers-reduced-motion: reduce) { .rd-spin { animation: none; } }
@@ -238,13 +224,6 @@ window.__ModuleLoader__.load({
       emptyTitle: '还没有服务器',
       emptyNeedDsh: '目标服务器需要先安装 dsh，并且在非交互 SSH 会话里能找到它。',
       emptyNeedKey: '本机需要能用 SSH 密钥免交互登录（推荐 ssh-agent；带口令的私钥请先 ssh-add）。',
-      emptyModesTitle: '选择一种连接方式：',
-      modeLaunch: 'SSH 启动远端 dsh',
-      modeAttach: 'SSH 连接已运行的 dsh',
-      modeUrl: '直接 URL',
-      modeLaunchDesc: 'SSH 登录后启动 dsh web，自动解析访问令牌并建立端口转发。',
-      modeAttachDesc: '远端已经跑着 dsh web，只建立端口转发，可填访问令牌。',
-      modeUrlDesc: '远端有反向代理或公网地址时，直接把完整 URL 嵌进面板。',
       statusConnecting: '连接中',
       statusConnected: '已连接',
       statusError: '出错',
@@ -295,7 +274,6 @@ window.__ModuleLoader__.load({
       addTitle: '添加服务器',
       fieldName: '名称',
       namePlaceholder: '例如：生产服务器',
-      fieldMode: '连接模式',
       fieldSshHost: 'SSH 主机',
       sshHostPlaceholder: 'server.example.com',
       fieldSshPort: 'SSH 端口',
@@ -304,33 +282,24 @@ window.__ModuleLoader__.load({
       fieldIdentityFile: '私钥路径（可选）',
       identityFilePlaceholder: '~/.ssh/id_ed25519',
       fieldRemotePort: '远端端口',
-      fieldLaunchCommand: '启动命令',
-      launchHint: '命令中的 {port} 会被替换成远端端口。',
-      fieldInstallCommand: '自动安装命令',
-      installHint: '首次连接时若远端没有 dsh，会自动执行这条命令安装（仅「SSH 启动远端 dsh」模式；需要远端有 npm 和网络）。',
-      fieldKeepRunning: '断开后保持远端运行（默认开启）',
-      keepRunningHint:
-        '开启后远端 dsh 会脱离 SSH 会话在后台常驻：点「返回」「断开」、本机睡眠或关掉应用，远端正在执行的任务都会继续；隧道断开时还会自动重连。关闭后远端 dsh 会随 SSH 会话结束而终止。远端日志 ~/.dsh/remote-desktop-web.log。',
+      autoConnectHint:
+        '连接时自动探测远端 dsh：未运行则在后台常驻启动，已在运行则直接接入（复用同一进程，任务不中断）。',
       restartRemote: '重启远端',
       restarting: '重启中…',
       restartHint: '结束远端服务器上的 dsh 进程并重新启动（会中断正在执行的任务）。',
-      keepAliveOffHint:
-        '当前未开启「断开后保持远端运行」：本机睡眠、断网或断开连接会终止远端正在执行的任务。',
-      keepAliveEnable: '开启并重启远端',
+      stopRemote: '停止远端',
+      stopping: '停止中…',
+      stopHint: '结束远端服务器上的 dsh 进程并断开隧道；这是唯一会主动结束远端进程的操作。',
+      confirmStopRemote: '确定停止「{name}」的远端 dsh？正在执行的任务会被中断。',
+      confirmStop: '确认停止',
+      remoteKeepsRunning:
+        '远端任务在本机断开后仍会继续运行：返回、断开、本机睡眠或关闭应用都不影响；只有「停止远端」会结束远端进程。',
       linkReconnecting: '网络或本机睡眠导致连接中断，正在自动重连…（远端任务会继续运行）',
       linkDown: '隧道已断开，等待网络恢复后自动重连；远端任务仍在运行。也可点「重新加载」或「重启远端」。',
-      fieldToken: '访问令牌（可选）',
-      tokenPlaceholder: '从远端 dsh web: 启动行复制',
-      tokenHint: '对应远端「dsh web: …?token=…」启动行里的 token；留空则不带令牌。',
-      fieldUrl: '完整 URL',
-      urlPlaceholder: 'https://dsh.example.com/?token=...',
       needName: '请填写名称。',
       nameTooLong: '名称最多 80 个字符。',
       needHost: '请填写 SSH 主机。',
       invalidPort: '端口需为 1–65535 的整数。',
-      needUrl: '请填写 URL。',
-      invalidUrl: 'URL 需为合法的 http(s) 地址。',
-      tokenTooLong: '访问令牌最多 256 个字符。',
       discoverCardTitle: '本地 SSH 自动发现',
       discoverTitle: '发现 {n} 个本地 SSH 主机',
       discoverCandidateCount: '{n} 个候选项',
@@ -373,13 +342,6 @@ window.__ModuleLoader__.load({
       emptyTitle: 'No servers yet',
       emptyNeedDsh: 'The remote server needs dsh installed and available in a non-interactive SSH session.',
       emptyNeedKey: 'This machine must log in with an SSH key non-interactively (ssh-agent recommended; run ssh-add for passphrase-protected keys).',
-      emptyModesTitle: 'Pick a connection mode:',
-      modeLaunch: 'Launch remote dsh over SSH',
-      modeAttach: 'Attach to running dsh over SSH',
-      modeUrl: 'Direct URL',
-      modeLaunchDesc: 'Start dsh web after logging in over SSH, parse its token, and forward the port automatically.',
-      modeAttachDesc: 'dsh web already runs remotely; only forward its port, with an optional access token.',
-      modeUrlDesc: 'Embed an existing public or reverse-proxied URL directly when no SSH is involved.',
       statusConnecting: 'Connecting',
       statusConnected: 'Connected',
       statusError: 'Error',
@@ -430,7 +392,6 @@ window.__ModuleLoader__.load({
       addTitle: 'Add server',
       fieldName: 'Name',
       namePlaceholder: 'e.g. Production server',
-      fieldMode: 'Connection mode',
       fieldSshHost: 'SSH host',
       sshHostPlaceholder: 'server.example.com',
       fieldSshPort: 'SSH port',
@@ -439,33 +400,24 @@ window.__ModuleLoader__.load({
       fieldIdentityFile: 'Private key path (optional)',
       identityFilePlaceholder: '~/.ssh/id_ed25519',
       fieldRemotePort: 'Remote port',
-      fieldLaunchCommand: 'Launch command',
-      launchHint: '`{port}` in the command is replaced with the remote port.',
-      fieldInstallCommand: 'Auto-install command',
-      installHint: 'On the first connection, if dsh is missing remotely this command runs to install it (launch mode only; the remote host needs npm and network access).',
-      fieldKeepRunning: 'Keep the remote dsh running after disconnect (on by default)',
-      keepRunningHint:
-        'When enabled the remote dsh detaches from the SSH session and keeps running: Back, Disconnect, host sleep and even quitting this app leave remote tasks running, and a dropped tunnel reconnects automatically. When disabled the remote dsh ends with the SSH session. Remote log ~/.dsh/remote-desktop-web.log.',
+      autoConnectHint:
+        'On connect, the remote dsh is detected automatically: if it is not running it starts detached in the background; if it is already running the connection reuses the same process, so running tasks are not interrupted.',
       restartRemote: 'Restart remote',
       restarting: 'Restarting…',
       restartHint: 'Stop the remote dsh process and start it again (interrupts running tasks).',
-      keepAliveOffHint:
-        'Keeping the remote dsh running is off: sleeping, losing the network or disconnecting terminates running remote tasks.',
-      keepAliveEnable: 'Enable and restart remote',
+      stopRemote: 'Stop remote',
+      stopping: 'Stopping…',
+      stopHint: 'Stop the remote dsh process and tear down the tunnel; this is the only action that ends remote processes.',
+      confirmStopRemote: 'Stop the remote dsh on "{name}"? Running tasks will be interrupted.',
+      confirmStop: 'Stop now',
+      remoteKeepsRunning:
+        'Remote tasks keep running after this machine disconnects: Back, Disconnect, host sleep and quitting the app do not affect them. Only "Stop remote" ends the remote process.',
       linkReconnecting: 'Network loss or host sleep broke the tunnel; reconnecting automatically (remote tasks keep running).',
       linkDown: 'Tunnel is down; it reconnects automatically when the network returns and remote tasks keep running. You can also use Reload or Restart remote.',
-      fieldToken: 'Access token (optional)',
-      tokenPlaceholder: 'Copy from the remote "dsh web:" line',
-      tokenHint: 'The token from the remote "dsh web: …?token=…" line; leave empty to omit it.',
-      fieldUrl: 'Full URL',
-      urlPlaceholder: 'https://dsh.example.com/?token=...',
       needName: 'Enter a name.',
       nameTooLong: 'Name must be at most 80 characters.',
       needHost: 'Enter the SSH host.',
       invalidPort: 'Port must be an integer between 1 and 65535.',
-      needUrl: 'Enter a URL.',
-      invalidUrl: 'URL must be a valid http(s) address.',
-      tokenTooLong: 'Access token must be at most 256 characters.',
       discoverCardTitle: 'Local SSH discovery',
       discoverTitle: 'Found {n} local SSH hosts',
       discoverCandidateCount: '{n} candidates',
@@ -597,15 +549,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function isValidHttpUrl(text) {
-      try {
-        const parsed = new URL(text)
-        return parsed.protocol === 'http:' || parsed.protocol === 'https:'
-      } catch {
-        return false
-      }
-    }
-
     /** 空串回落默认端口；非法输入返回 null。 */
     function parsePortValue(raw, fallback) {
       const text = String(raw == null ? '' : raw).trim()
@@ -621,17 +564,11 @@ window.__ModuleLoader__.load({
       return {
         id: '',
         name: '',
-        mode: 'launch',
         host: '',
         port: String(DEFAULT_SSH_PORT),
         user: '',
         identityFile: '',
         remotePort: String(DEFAULT_REMOTE_PORT),
-        launchCommand: DEFAULT_LAUNCH_COMMAND,
-        installCommand: DEFAULT_INSTALL_COMMAND,
-        keepRemoteRunning: true,
-        token: '',
-        url: '',
       }
     }
 
@@ -639,17 +576,11 @@ window.__ModuleLoader__.load({
       return {
         id: host.id || '',
         name: host.name || '',
-        mode: MODES.includes(host.mode) ? host.mode : 'launch',
         host: host.host || '',
         port: host.port == null ? String(DEFAULT_SSH_PORT) : String(host.port),
         user: host.user || '',
         identityFile: host.identityFile || '',
         remotePort: host.remotePort == null ? String(DEFAULT_REMOTE_PORT) : String(host.remotePort),
-        launchCommand: host.launchCommand || DEFAULT_LAUNCH_COMMAND,
-        installCommand: host.installCommand || DEFAULT_INSTALL_COMMAND,
-        keepRemoteRunning: host.keepRemoteRunning !== false,
-        token: host.token || '',
-        url: host.url || '',
       }
     }
 
@@ -662,46 +593,28 @@ window.__ModuleLoader__.load({
       if (!name) return { error: 'needName' }
       if (name.length > MAX_NAME_CHARS) return { error: 'nameTooLong' }
 
-      const mode = MODES.includes(draft.mode) ? draft.mode : 'launch'
+      const host = draft.host.trim()
+      if (!host) return { error: 'needHost' }
+      const port = parsePortValue(draft.port, DEFAULT_SSH_PORT)
+      if (port === null) return { error: 'invalidPort' }
+      const remotePort = parsePortValue(draft.remotePort, DEFAULT_REMOTE_PORT)
+      if (remotePort === null) return { error: 'invalidPort' }
+
       const input = {
         name,
-        mode,
-        host: draft.host.trim(),
+        host,
         user: draft.user.trim(),
         identityFile: draft.identityFile.trim(),
-        launchCommand: draft.launchCommand.trim(),
-        installCommand: mode === 'launch' ? draft.installCommand.trim() || DEFAULT_INSTALL_COMMAND : '',
-        keepRemoteRunning: mode === 'launch' ? draft.keepRemoteRunning === true : false,
-        token: mode === 'attach' ? draft.token.trim() : '',
-        url: '',
-        port: DEFAULT_SSH_PORT,
-        remotePort: DEFAULT_REMOTE_PORT,
+        port,
+        remotePort,
       }
-      if (input.token.length > MAX_TOKEN_CHARS) return { error: 'tokenTooLong' }
-
-      if (mode === 'url') {
-        const url = draft.url.trim()
-        if (!url) return { error: 'needUrl' }
-        if (!isValidHttpUrl(url)) return { error: 'invalidUrl' }
-        input.url = url
-      } else {
-        if (!input.host) return { error: 'needHost' }
-        const port = parsePortValue(draft.port, DEFAULT_SSH_PORT)
-        if (port === null) return { error: 'invalidPort' }
-        const remotePort = parsePortValue(draft.remotePort, DEFAULT_REMOTE_PORT)
-        if (remotePort === null) return { error: 'invalidPort' }
-        input.port = port
-        input.remotePort = remotePort
-      }
-
       if (draft.id) input.id = draft.id
       return { ok: true, host: input }
     }
 
-    /** 主机卡片第二行：user@host:port，URL 模式直接显示 URL。 */
+    /** 主机卡片第二行：user@host:port。 */
     function hostEndpoint(host) {
       if (!host) return ''
-      if (host.mode === 'url') return String(host.url || '')
       const target = host.user ? `${host.user}@${host.host || ''}` : String(host.host || '')
       return host.port ? `${target}:${host.port}` : target
     }
@@ -712,23 +625,18 @@ window.__ModuleLoader__.load({
       return log.slice(-LOG_TAIL_LINES).join('\n')
     }
 
-    /** discover 候选 → POST /hosts 的 HostInput（launch 模式，默认远端端口与启动命令）。 */
+    /** discover 候选 → POST /hosts 的 HostInput（默认远端端口）。 */
     function candidateToHost(candidate) {
       const host = String(candidate.host || '').trim()
       const rawName = String(candidate.name || candidate.alias || host).trim()
       const port = Number(candidate.port)
       return {
         name: (rawName || host).slice(0, MAX_NAME_CHARS),
-        mode: 'launch',
         host,
         port: Number.isInteger(port) && port >= 1 && port <= 65535 ? port : DEFAULT_SSH_PORT,
         user: String(candidate.user || '').trim(),
         identityFile: String(candidate.identityFile || '').trim(),
         remotePort: DEFAULT_REMOTE_PORT,
-        launchCommand: DEFAULT_LAUNCH_COMMAND,
-        installCommand: DEFAULT_INSTALL_COMMAND,
-        token: '',
-        url: '',
       }
     }
 
@@ -869,9 +777,11 @@ window.__ModuleLoader__.load({
             onDisconnect,
             onRestart,
             restartBusy,
-            keepRunning,
-            keepBusy,
-            onEnableKeepRunning,
+            onStop,
+            stopBusy,
+            confirmStop,
+            onConfirmStop,
+            onCancelStop,
             linkStatus,
             onOpenExternal,
             busy,
@@ -1486,7 +1396,7 @@ window.__ModuleLoader__.load({
                 {
                   type: 'button',
                   className: 'rd-btn rd-btnSmall',
-                  disabled: busy || restartBusy,
+                  disabled: busy || restartBusy || stopBusy,
                   onClick: onRestart,
                   title: t('restartHint'),
                 },
@@ -1494,10 +1404,39 @@ window.__ModuleLoader__.load({
               ),
               h(
                 'button',
-                { type: 'button', className: 'rd-btn rd-btnSmall rd-btnDanger', disabled: busy, onClick: onDisconnect },
+                {
+                  type: 'button',
+                  className: 'rd-btn rd-btnSmall rd-btnDanger',
+                  disabled: busy || restartBusy || stopBusy,
+                  onClick: onStop,
+                  title: t('stopHint'),
+                },
+                stopBusy ? t('stopping') : t('stopRemote'),
+              ),
+              h(
+                'button',
+                { type: 'button', className: 'rd-btn rd-btnSmall', disabled: busy, onClick: onDisconnect },
                 t('disconnect'),
               ),
             ),
+            confirmStop
+              ? h(
+                  'div',
+                  { className: 'rd-remoteInfo' },
+                  h('span', { className: 'rd-remoteInfoText' }, fmt('confirmStopRemote', { name })),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'rd-btn rd-btnSmall rd-btnDanger',
+                      disabled: stopBusy,
+                      onClick: onConfirmStop,
+                    },
+                    stopBusy ? t('stopping') : t('confirmStop'),
+                  ),
+                  h('button', { type: 'button', className: 'rd-btn rd-btnSmall rd-btnGhost', onClick: onCancelStop }, t('cancel')),
+                )
+              : null,
             h(
               'div',
               { className: 'rd-remoteBody' },
@@ -1515,21 +1454,11 @@ window.__ModuleLoader__.load({
                   ),
                 )
               : null,
-            phase === 'ready' && keepRunning === false
+            phase === 'ready'
               ? h(
                   'div',
                   { className: 'rd-remoteInfo' },
-                  h('span', { className: 'rd-remoteInfoText' }, t('keepAliveOffHint')),
-                  h(
-                    'button',
-                    {
-                      type: 'button',
-                      className: 'rd-btn rd-btnSmall rd-btnPrimary',
-                      disabled: keepBusy || restartBusy,
-                      onClick: onEnableKeepRunning,
-                    },
-                    keepBusy ? t('restarting') : t('keepAliveEnable'),
-                  ),
+                  h('span', { className: 'rd-remoteInfoText' }, t('remoteKeepsRunning')),
                 )
               : null,
             phase === 'ready' && loginUrl
@@ -1589,9 +1518,8 @@ window.__ModuleLoader__.load({
           const [logTail, setLogTail] = useState([])
           const [generation, setGeneration] = useState(0)
           const [restartBusy, setRestartBusy] = useState(false)
-          const [keepRunning, setKeepRunning] = useState(true)
-          const [keepBusy, setKeepBusy] = useState(false)
-          const [currentHost, setCurrentHost] = useState(null)
+          const [stopBusy, setStopBusy] = useState(false)
+          const [confirmStop, setConfirmStop] = useState(false)
           const [linkStatus, setLinkStatus] = useState('connected')
           const connectRequested = useRef(false)
 
@@ -1652,8 +1580,6 @@ window.__ModuleLoader__.load({
                   return
                 }
                 setHostName(host.name || host.host || fallbackName)
-                setCurrentHost(host)
-                setKeepRunning(host.keepRemoteRunning !== false)
                 const connection = (payload.active || {})[hostId] || null
                 if (connection && Array.isArray(connection.log)) setLogTail(connection.log.slice(-8))
                 if (connection && connection.status === 'connected' && connection.url) {
@@ -1739,20 +1665,30 @@ window.__ModuleLoader__.load({
               .finally(() => backToLocal())
           }
 
-          /** 一键开启「保持远端运行」：更新主机配置后重启远端，切到常驻模式。 */
-          const enableKeepRunning = () => {
-            if (keepBusy || !currentHost) return
-            setKeepBusy(true)
-            postJson('/hosts', { host: { ...currentHost, keepRemoteRunning: true } })
-              .then(() => {
-                setKeepRunning(true)
-                restartRemote()
-              })
+          /** 请求停止远端：先弹页内确认条，真正结束进程在 confirmStopNow 里做。 */
+          const requestStop = () => {
+            if (stopBusy) return
+            setConfirmStop(true)
+          }
+
+          const cancelStop = () => setConfirmStop(false)
+
+          /**
+           * 确认停止远端：Host 结束远端 dsh 并断开隧道。
+           * 这是唯一会主动结束远端进程的操作；成功后回到本地界面。
+           */
+          const confirmStopNow = () => {
+            if (stopBusy) return
+            setConfirmStop(false)
+            setStopBusy(true)
+            setError('')
+            postJson('/stop', { id: hostId })
+              .then(() => backToLocal())
               .catch((cause) => {
                 setPhase('error')
                 setError(String((cause && cause.message) || cause))
               })
-              .finally(() => setKeepBusy(false))
+              .finally(() => setStopBusy(false))
           }
 
           if (phase === 'ready' && target) {
@@ -1770,9 +1706,11 @@ window.__ModuleLoader__.load({
                 onDisconnect: disconnect,
                 onRestart: restartRemote,
                 restartBusy,
-                keepRunning,
-                keepBusy,
-                onEnableKeepRunning: enableKeepRunning,
+                onStop: requestStop,
+                stopBusy,
+                confirmStop,
+                onConfirmStop: confirmStopNow,
+                onCancelStop: cancelStop,
                 linkStatus,
                 onOpenExternal: () => {
                   void openExternalUrl(target.url)
@@ -1802,12 +1740,43 @@ window.__ModuleLoader__.load({
                         {
                           type: 'button',
                           className: 'rd-btn rd-btnSmall',
-                          disabled: restartBusy,
+                          disabled: restartBusy || stopBusy,
                           onClick: restartRemote,
                           title: t('restartHint'),
                         },
                         restartBusy ? t('restarting') : t('restartRemote'),
                       ),
+                      !confirmStop
+                        ? h(
+                            'button',
+                            {
+                              type: 'button',
+                              className: 'rd-btn rd-btnSmall rd-btnDanger',
+                              disabled: restartBusy || stopBusy,
+                              onClick: requestStop,
+                              title: t('stopHint'),
+                            },
+                            stopBusy ? t('stopping') : t('stopRemote'),
+                          )
+                        : [
+                            h(
+                              'button',
+                              {
+                                key: 'confirmStop',
+                                type: 'button',
+                                className: 'rd-btn rd-btnSmall rd-btnDanger',
+                                disabled: stopBusy,
+                                onClick: confirmStopNow,
+                                title: t('stopHint'),
+                              },
+                              stopBusy ? t('stopping') : t('confirmStop'),
+                            ),
+                            h(
+                              'button',
+                              { key: 'cancelStop', type: 'button', className: 'rd-btn rd-btnSmall rd-btnGhost', onClick: cancelStop },
+                              t('cancel'),
+                            ),
+                          ],
                     ),
                   )
                 : h(
@@ -2138,76 +2107,16 @@ window.__ModuleLoader__.load({
                 disabled: actionBusy,
                 onChange: (event) => updateDraft({ [key]: event.target.value }),
               })
-            const modeSwitch = h(
+            const sshFields = h(
               'div',
-              { className: 'rd-field rd-fieldFull' },
-              h('span', { className: 'rd-label' }, t('fieldMode')),
-              h(
-                'div',
-                { className: 'rd-seg' },
-                MODES.map((mode) =>
-                  h(
-                    'button',
-                    {
-                      key: mode,
-                      type: 'button',
-                      className: draft && draft.mode === mode ? 'rd-segBtn is-active' : 'rd-segBtn',
-                      'aria-pressed': draft && draft.mode === mode,
-                      disabled: actionBusy,
-                      onClick: () => updateDraft({ mode }),
-                    },
-                    t(MODE_LABEL_KEYS[mode]),
-                  ),
-                ),
-              ),
+              { className: 'rd-formGrid' },
+              field(t('fieldSshHost'), textInput('host', t('sshHostPlaceholder'))),
+              field(t('fieldSshPort'), portInput('port')),
+              field(t('fieldUser'), textInput('user', t('userPlaceholder'))),
+              field(t('fieldIdentityFile'), textInput('identityFile', t('identityFilePlaceholder'))),
+              field(t('fieldRemotePort'), portInput('remotePort')),
+              h('p', { className: 'rd-hint rd-fieldFull' }, t('autoConnectHint')),
             )
-            const sshFields =
-              draft && draft.mode !== 'url'
-                ? h(
-                    'div',
-                    { className: 'rd-formGrid' },
-                    field(t('fieldSshHost'), textInput('host', t('sshHostPlaceholder'))),
-                    field(t('fieldSshPort'), portInput('port')),
-                    field(t('fieldUser'), textInput('user', t('userPlaceholder'))),
-                    field(t('fieldIdentityFile'), textInput('identityFile', t('identityFilePlaceholder'))),
-                  )
-                : null
-            const tailFields =
-              draft && draft.mode === 'url'
-                ? h(
-                    'div',
-                    { className: 'rd-formGrid' },
-                    field(t('fieldUrl'), textInput('url', t('urlPlaceholder')), true),
-                  )
-                : draft && draft.mode === 'launch'
-                  ? h(
-                      'div',
-                      { className: 'rd-formGrid' },
-                      field(t('fieldRemotePort'), portInput('remotePort')),
-                      field(t('fieldLaunchCommand'), textInput('launchCommand'), true),
-                      h('p', { className: 'rd-hint rd-fieldFull' }, t('launchHint')),
-                      field(t('fieldInstallCommand'), textInput('installCommand'), true),
-                      h('p', { className: 'rd-hint rd-fieldFull' }, t('installHint')),
-                      h(
-                        'label',
-                        { className: 'rd-check rd-fieldFull' },
-                        h('input', {
-                          type: 'checkbox',
-                          checked: draft.keepRemoteRunning === true,
-                          disabled: actionBusy,
-                          onChange: (event) => updateDraft({ keepRemoteRunning: event.target.checked }),
-                        }),
-                        h('span', null, t('fieldKeepRunning')),
-                      ),
-                      h('p', { className: 'rd-hint rd-fieldFull' }, t('keepRunningHint')),
-                    )
-                  : h(
-                      'div',
-                      { className: 'rd-formGrid' },
-                      field(t('fieldRemotePort'), portInput('remotePort')),
-                      field(t('fieldToken'), textInput('token', t('tokenPlaceholder'))),
-                      h('p', { className: 'rd-hint rd-fieldFull' }, t('tokenHint')),
-                    )
 
             return h(
               'div',
@@ -2224,9 +2133,7 @@ window.__ModuleLoader__.load({
                 'div',
                 { className: 'rd-form' },
                 field(t('fieldName'), textInput('name', t('namePlaceholder')), true),
-                modeSwitch,
                 sshFields,
-                tailFields,
                 draftError ? h('p', { className: 'rd-formError', role: 'alert' }, draftError) : null,
                 testResult
                   ? h(

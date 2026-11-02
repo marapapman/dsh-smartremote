@@ -57,35 +57,33 @@ if (admission.peer.principal.kind !== 'owner') return jsonResponse(res, 403, { o
         hosts: HostView[], active: Record<id, ConnectionView> }`
 - `POST /hosts`      body `{ host: HostInput }` → `{ ok:true, host: HostView }`
 - `POST /hosts/delete` body `{ id }` → 先断开再删除 → `{ ok:true }`
-- `POST /connect`    body `{ id }` → 立即返回 `{ ok:true }`，后台连接，客户端轮询 `/state`
-- `POST /disconnect` body `{ id }` → `{ ok:true }`
-- `POST /restart`    body `{ id }` → 手动重启远端：结束远端端口上的 dsh 并等端口释放，
-  再重建连接与隧道 → `{ ok:true }`（`url` 模式 400；未知 id 404）
+- `POST /connect`    body `{ id }` → 立即返回 `{ ok:true }`，后台按「探测 → 常驻启动/复用 → 建隧道」推进，客户端轮询 `/state`
+- `POST /disconnect` body `{ id }` → 只拆本地隧道，**不结束远端 dsh** → `{ ok:true }`
+- `POST /stop`       body `{ id }` → 唯一会主动结束远端 dsh 的操作：先断开隧道，再结束远端
+  `<remotePort>` 上的 dsh 并等端口释放 → `{ ok:true, stopped:boolean }`（未知 id 404）
+- `POST /restart`    body `{ id }` → 结束远端端口上的 dsh 并等端口释放，再重建连接与隧道
+  → `{ ok:true }`（未知 id 404）
 - `POST /test`       body `{ id }` → 同步跑一次 SSH 测试（≤15s）→ `{ ok:true, output }` 或 `{ ok:false, error }`
 - `POST /client-report` body `{ report }` → 追加一行 JSON 到 `$DSH_HOME/remote-desktop-client.log`
 - `POST /open-url`    body `{ url }` → 用 Host 所在机器的默认浏览器打开该链接
   （远端登录授权页用；仅 http(s)、≤4096 字符、不含账号口令）→ `{ ok:true, opened:true, via }`
 
-`HostView = { id, name, mode, host, port, user, identityFile, remotePort,
-launchCommand, installCommand, keepRemoteRunning, token, url, updatedAt }`
+`HostView = { id, name, host, port, user, identityFile, remotePort, updatedAt }`
 `ConnectionView = { id, status, url, error, log, localPort, startedAt }`
 - `status`: `'connecting' | 'connected' | 'error' | 'disconnected'`
-- `url`: iframe 地址，仅 `connected` 时有值
+- `url`: 远端页面地址，仅 `connected` 时有值
 - `log`: string[]，最多保留 80 行
 
-`mode` 三种：
-- `'launch'`：SSH 连上后在远端启动 dsh web（默认命令见下），解析启动行里的 token，
-  把本地端口转发到远端端口，iframe 指向 `http://127.0.0.1:<localPort>/?token=<token>`。
-  `keepRemoteRunning: true` 时改为「后台常驻」：远端用 `setsid nohup` 脱离 SSH 会话启动，
-  token 从远端 `~/.dsh/remote-desktop-web.log` 读回，隧道只做 `-L`（不再执行远端命令）。
-- `'attach'`：远端已有 dsh web 在跑，只建端口转发；`token` 由用户填（可空）。
-- `'url'`：不做 SSH，直接把用户给的完整 URL 作为 iframe 地址。
+**连接方式固定为「SSH + 自动探测」，没有 mode / URL / token / 保活开关等配置**（v0.11.0 起）：
+连接时先在远端探测 `<remotePort>`——已有 dsh 就取回令牌复用（正在执行的任务不中断）；没有就用
+`setsid nohup` 脱离 ssh 会话常驻启动；端口被别的进程占用则明确失败。隧道只做 `-L`（`-N`，
+不执行远端命令），因此本地断开/退出不影响远端。旧版本配置里的 `mode` / `url` / `token` /
+`launchCommand` / `installCommand` / `keepRemoteRunning` 字段在读写时一律忽略。
 
-HostInput 校验：`name` ≤80；`mode` 三选一；`host`/`user`/`identityFile` 字符串
-（去掉首尾空白）；`port` 默认 22、`remotePort` 默认 39080，范围 1–65535；
-`launchCommand` 默认 `dsh --profile web --port {port} --no-open`（`{port}` 替换为 remotePort）；
-`keepRemoteRunning` 仅 `'launch'` 模式保留（布尔，默认 `false`），其他模式强制 `false`；
-`url` 仅 `'url'` 模式要求是合法 http(s) URL；`token` ≤256。
+HostInput 校验：`name` ≤80（缺省用 host）；`host` 必填 ≤255；`user` ≤128；
+`identityFile` ≤1024（去掉首尾空白）；`port` 默认 22、`remotePort` 默认 39080，范围 1–65535。
+远端启动命令固定 `dsh --profile web --port {port} --no-open`，安装命令固定
+`npm install -g @deepseek-ai/dsh`。
 
 ### 持久化
 
@@ -93,7 +91,7 @@ HostInput 校验：`name` ≤80；`mode` 三选一；`host`/`user`/`identityFile
 目录不存在时 mkdir -p）。结构 `{ version: 1, hosts: HostView[] }`，写临时文件再 rename。
 启动时读取，坏文件忽略并重命名为 `.bak`。`id` 用 `crypto.randomUUID()`。
 
-### SSH 连接（launch 模式）
+### SSH 连接（自动探测 + 永远常驻 + 只建隧道）
 
 1. `net.createServer()` 在 `127.0.0.1:0` 监听拿到空闲 `localPort` 后立刻 close。
 2. 找 ssh：`where ssh`（win32）/ `which ssh`，缓存结果；找不到则连接直接报错
@@ -102,28 +100,32 @@ HostInput 校验：`name` ≤80；`mode` 三选一；`host`/`user`/`identityFile
    ```
    ssh -o BatchMode=yes -o ConnectTimeout=10 -o ExitOnForwardFailure=yes
        -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=15 -o ServerAliveCountMax=3
+       -o TCPKeepAlive=yes
        -p <port> [-i <identityFile 展开 ~>]
-       -L 127.0.0.1:<localPort>:127.0.0.1:<remotePort>
-       <user>@<host> "<launchCommand 替换 {port}>"
+       -L 127.0.0.1:<localPort>:127.0.0.1:<remotePort> -N <user>@<host>
    ```
-   attach 模式把最后一个参数换成 `-N`（无远端命令）。
-4. 合并 stdout+stderr 进 ring buffer（脱敏：不含私钥内容），用
-   `/[?&]token=([A-Za-z0-9._~-]+)/` 抓 token。
-5. 抓到 token（或 attach 模式已有 token）后，用 `node:http` 请求
-   `http://127.0.0.1:<localPort>/`（3s 超时，忽略 401/302），有响应即 `connected`，
-   `url = http://127.0.0.1:<localPort>/?token=<token>`（无 token 时无 query）。
+   永远带 `-N`：远端 dsh 不挂在 ssh 会话下，断开只影响隧道。
+4. 合并 stdout+stderr 进 ring buffer（脱敏：`token=` 值打码；token 本身来自探测脚本，
+   不再从 ssh 输出里解析）。
+5. 用 `node:http` 请求 `http://127.0.0.1:<localPort>/`（3s 超时，忽略 401/302），
+   有响应即 `connected`，`url = http://127.0.0.1:<localPort>/?token=<token>`。
 6. 45s 没就绪 → `error`，附最后 20 行日志；进程退出时：未就绪 → `error`，已就绪 →
-   `disconnected`。
-7. 断开：`child.kill()`，2 秒后仍活着则 win32 `taskkill /pid <pid> /T /F`。
-8. 插件卸载（`ctx.effect` 清理）时断开所有连接。
-9. `keepRemoteRunning: true` 时（「断开后保持远端运行」）流程改为：
-   1. 先用远端脚本探测端口：有 dsh → 从 `~/.dsh/remote-desktop-web.log` 里按
-      `:<port>/?token=` 取回令牌并复用（`REUSE=1`）；端口空闲 → `setsid nohup` 后台启动，
-      只读取本次新增日志行里的令牌（`REUSE=0`）；端口被别人占用 → 明确失败（`FAILED=port-busy`）。
-   2. 隧道只做 `-L`（等价 attach 的 `-N`），不再把 dsh 作为 ssh 会话子进程。
-   3. 断开/退出应用**不清理**远端进程（`cleanupRemotePort` 直接返回），因此远端任务继续，
-      下次连接复用同一进程；`POST /restart` 是唯一会强制结束它的操作。
+   `disconnected` 并进入自动重连退避。
+7. 断开：`child.kill()`，2 秒后仍活着则 win32 `taskkill /pid <pid> /T /F`；
+   **不清理远端进程**。插件卸载（`ctx.effect` 清理）时同样只断开本地隧道。
+8. 每次连接都先执行「自动探测 + 常驻启动」（`prepareDetachedRemoteDsh`）：
+   1. 远端脚本（base64 交给 `sh`）检查 `<remotePort>`：有 dsh → 从
+      `~/.dsh/remote-desktop-web.log` 里按 `:<port>/?token=` 取回令牌并复用（`REUSE=1`）；
+      端口空闲 → `setsid nohup sh -c <固定启动命令>` 后台启动，只读本次新增日志行里的令牌
+      （`REUSE=0`）；端口被别的进程占用 → `FAILED=port-busy`；有 dsh 但日志里没有令牌
+      （旧版本残留）→ 结束该进程后按常驻方式重启一次。
+   2. 隧道只做 `-L`（`-N`），远端进程独立于 ssh 会话。
+   3. 隧道意外断开（睡眠/断网/Wi-Fi 切换）按 `1.5s/3s/5s/8s/13s/21s` 退避自动重连（最多 6 次），
+      沿用原本地端口；重连后复用同一个远端进程。
    4. 远端日志固定为 `~/.dsh/remote-desktop-web.log`（>2 MB 时轮转为 `.1`）。
+9. `POST /stop`（停止远端）与 `POST /restart`（重启远端）是唯一会结束远端 dsh 的操作：
+   `stop` 结束端口上的 dsh 后不再重连（`userStopped` 抑制自动重连），`restart` 结束等端口释放后
+   重新建连（新连接会自动常驻启动）。
 
 SSH 测试：`ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new
 -p <port> [-i <key>] <user>@<host> "echo dsh-ssh-ok"`，12s 超时，返回输出或错误。
@@ -159,14 +161,15 @@ SSH 测试：`ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=
      `连接 / 断开`、`在面板中打开`（connected 时）、`在浏览器打开`、`测试`、`编辑`、`删除`。
    - 连接中/错误时显示 `log` 最后几行（等宽字体、可滚动）。
    - 空态：说明需要服务器已安装 dsh、可用 SSH 密钥登录、以及三种模式怎么选。
-3. **编辑卡**（内联，非弹窗）：
+3. **编辑卡**（内联，非弹窗，v0.11.0 起只有 SSH 目标字段）：
    - 名称
-   - 模式三选一（segmented）：SSH 启动远端 dsh / SSH 连接已运行的 dsh / 直接 URL
-   - SSH 模式：SSH 主机、SSH 端口、用户名、私钥路径（可选，placeholder `~/.ssh/id_ed25519`）
-   - launch：远端端口（默认 39080）、启动命令（默认 `dsh --profile web --port {port} --no-open`）、说明 `{port}` 会被替换
-   - attach：远端端口、访问令牌（可选，提示从远端 `dsh web:` 启动行复制）
-   - url：完整 URL
+   - SSH 主机、SSH 端口、用户名、私钥路径（可选，placeholder `~/.ssh/id_ed25519`）
+   - 远端端口（默认 39080），下方说明「连接时自动探测远端 dsh：未运行则后台常驻启动，
+     已在运行则直接接入（复用同一进程，任务不中断）」
    - 保存 / 取消；保存成功后刷新 state
+4. **远端视图**（连接就绪后接管中央区域，无地址栏 webview）：
+   顶栏 返回 / 主机名 / 重新加载 / 重启远端 / 停止远端（页内二次确认）/ 断开。
+   「停止远端」「重启远端」是唯一会结束远端进程的入口，其余按钮只影响本地视图。
 
 ### 文案与样式
 
@@ -249,7 +252,7 @@ SSH 测试：`ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=
     ssh-agent 身份数、默认密钥）。
   - 「刷新」「全部导入」按钮；每行显示名称、来源标签、`user@host:port`、密钥提示，
     右侧「导入」按钮（`imported` 候选显示「已导入」且禁用）。
-  - 导入 = `POST /hosts`，`mode:'launch'`，默认 `remotePort:39080` 与默认启动命令，
+  - 导入 = `POST /hosts`（v0.11.0 起不再有 mode），默认 `remotePort:39080`，
     `identityFile` 用候选值；成功后刷新 state 与 discover。
   - 读取失败时卡片内显示错误与「重试」，不影响主机列表。
 - 全部导入串行执行（避免并发写 profile），完成后统一刷新。
@@ -257,7 +260,9 @@ SSH 测试：`ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=
 ## 交互验收点
 
 - 侧边栏出现「远程主机」图标，点击打开主面板。
-- 添加一个「直接 URL」服务器，连接后能内嵌打开该 URL。
+- 添加一台可 SSH 的服务器，点侧栏图标自动探测：远端没有 dsh 就后台常驻启动，已有就复用。
+- 点「返回」/「断开」/关掉应用，远端任务继续运行；重新点图标复用同一进程。
+- 「停止远端」页内二次确认后结束远端 dsh；「重启远端」结束并重新拉起。
 - 未配置 ssh 的机器上点 SSH 连接，能看到明确错误日志，不卡死、不崩面板。
 - 面板关闭再打开，state 仍在；应用重启后 host 配置仍在（持久化）。
 - API 未鉴权请求返回 401。
@@ -678,6 +683,45 @@ const timer = setTimeout(() => { log('步骤超时'); kill(child); finish(null) 
 `omp/deepseek-v4.1-flash`，不依赖该账号，对话不受影响。要恢复账号就重新走登录流程。
 另加 `kind:"ws"` 诊断（webview 内包装 `WebSocket`，记录 close code/reason/存活时长），
 以后再遇到可直接区分「网络断开（1006）」与「对端主动关闭（1000/4xxx）」。
+
+### v0.11.0 — 去掉连接方式/保活选项，改为「自动探测 + 永远常驻 + 停止远端」
+
+需求：用户不希望再配置「SSH 启动 / SSH 连接已运行 / 直接 URL」三种模式，也不想要
+「断开后保持远端运行」开关；期望的连接语义是——连接时自动探测远端有没有 dsh，没有就
+后台常驻启动，有就直接接入；本地返回/断开/睡眠/关应用都不影响远端任务，除非本地显式
+「停止远端」或「重启远端」。
+
+Host 半：
+
+- `HostInput`/`HostView` 收敛为 `{ id, name, host, port, user, identityFile, remotePort,
+  updatedAt }`；`validateHostInput` 忽略旧字段（`mode`/`url`/`token`/`launchCommand`/
+  `installCommand`/`keepRemoteRunning`），旧配置文件可直接读入（旧 `url` 模式记录因缺 host
+  被丢弃）。启动/安装命令固定为常量。
+- 每次连接都走 `prepareDetachedRemoteDsh`：探测端口 → 有 dsh 复用（`REUSE=1`）/
+  没有则 `setsid nohup` 常驻启动（`REUSE=0`）/ 被非 dsh 进程占用明确失败
+  （`FAILED=port-busy`）；有 dsh 但日志无令牌时结束并按常驻方式重启一次。
+- `buildSshArgs` 永远带 `-N`，不再把启动命令交给 ssh；`cleanupRemotePort` 只记日志，
+  `POST /disconnect`、插件卸载、应用退出都不结束远端 dsh。
+- 新增 `POST /stop`（`buildRemoteStopScript`：`fuser` 找 dsh → `kill` → 等端口释放 →
+  `kill -9` 兜底 → `STOPPED=0/1`），先断开隧道再结束远端，是唯一主动结束远端任务的操作；
+  `POST /restart` 移除 `url` 模式 400 分支，`stop`/`restart` 未知 id 仍是 404。
+- 删除 `prepareRemotePort`/`buildRemotePortPrepScript`/`isDetachedLaunch`/ssh 输出抓 token；
+  导出改为 `{ buildRemoteDetachedLaunchScript, buildRemoteStopScript, buildSshArgs }`。
+
+Client 半：
+
+- 表单只剩六个字段 + `autoConnectHint`；删除模式选择器、URL/token/启动/安装命令输入、
+  保活复选框及相关 i18n（中英同步，112→113 键）。
+- 远端视图顶栏：返回 / 重新加载 / 重启远端 / 停止远端（页内二次确认，
+  不再用原生 `window.confirm`）/ 断开；「断开」从危险样式改为普通样式；
+  ready 时显示一行 `remoteKeepsRunning` 说明（返回/断开/睡眠/关应用都不影响远端）。
+- 连接失败页也可直接「重启远端」「停止远端」。
+
+测试：`host-smoke` 重写为新契约（102 项，含旧字段忽略、8 字段 HostView、`/stop` 404、
+旧配置重载迁移）；`detached-smoke` 27 项（`-N` argv、启动/停止脚本约束）；
+`client-smoke` 15 项。真机集成：在阿里云服务器（非 39080 测试端口）验证脚本 `sh -n`、
+常驻启动、复用同 token、`ssh -N -L` 隧道 HTTP 303、`STOPPED=1/0`、端口释放且 39080
+上的 dsh 不受影响。
 
 
 

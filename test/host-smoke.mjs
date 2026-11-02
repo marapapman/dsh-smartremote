@@ -1,8 +1,12 @@
 /**
  * Host 半冒烟测试：用假 Cordis ctx 挂载 index.js，起真实 HTTP 服务，验证
- * 鉴权 / CRUD / 连接状态机（url 模式）/ 校验 / 404 缺省路由 / 持久化 / 卸载清理，
+ * 鉴权 / CRUD / 参数校验 / 404 缺省路由 / 持久化 / 重载恢复 / 卸载清理，
  * 以及「本地 SSH 自动发现」（ssh_config / known_hosts 解析、Include、去重、
- * imported 标记、missing 目录降级）。
+ * imported 标记、missing 目录降级），另有导出纯函数的协议约束断言。
+ *
+ * 连接方式已固定为「SSH + 自动探测」，HostView 只剩 SSH 目标字段；
+ * 因此这里不调用会真的拉起 ssh 的接口（POST /connect、/test、/stop、/restart
+ * 使用有效 id），只覆盖未知 id、参数校验、CRUD、发现等纯本地路径。
  *
  * 运行（workspace 根）：
  *   node remote-desktop/test/host-smoke.mjs
@@ -20,6 +24,19 @@ import { pathToFileURL } from 'node:url'
 const PLUGIN = pathToFileURL(join(import.meta.dirname, '..', 'index.js')).href
 const OWNER_COOKIE = 'dsh-desktop-test-cookie=owner'
 const results = []
+
+/** HostView 的 8 个字段（顺序与 SPEC 一致）。 */
+const HOST_VIEW_FIELDS = ['id', 'name', 'host', 'port', 'user', 'identityFile', 'remotePort', 'updatedAt']
+const HOST_VIEW_FIELDS_SORTED = HOST_VIEW_FIELDS.slice().sort()
+/** 新契约里已从 HostView / HostInput 移除的旧字段。 */
+const LEGACY_HOST_FIELDS = ['mode', 'url', 'token', 'launchCommand', 'installCommand', 'keepRemoteRunning']
+
+/** 断言值恰好拥有 HostView 的 8 个字段。 */
+function hasExactHostViewFields(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  const keys = Object.keys(value).sort()
+  return keys.length === HOST_VIEW_FIELDS.length && JSON.stringify(keys) === JSON.stringify(HOST_VIEW_FIELDS_SORTED)
+}
 
 /* ------------------ 自动发现测试夹具（隔离的临时 ssh 目录） ------------------ */
 
@@ -203,6 +220,52 @@ async function main() {
   process.env.DSH_REMOTE_DESKTOP_SSH_DIR = sshDir
   const first = createFakeContext()
   const module = await import(PLUGIN)
+
+  // 0. 协议纯函数（导出仅供测试）：隧道 argv / 停止脚本 / 常驻启动脚本
+  const tunnelHost = { host: 'example.com', port: 22, user: 'root', identityFile: '', remotePort: 39080 }
+  const tunnelArgs = module.buildSshArgs(tunnelHost, 40123, 39080)
+  check('buildSshArgs always uses -N (tunnel only)', tunnelArgs.includes('-N'))
+  check(
+    'buildSshArgs ends with -N and user@host',
+    tunnelArgs.at(-2) === '-N' && tunnelArgs.at(-1) === 'root@example.com',
+    tunnelArgs.slice(-2).join(' '),
+  )
+  check(
+    'buildSshArgs forwards 127.0.0.1:40123:127.0.0.1:39080',
+    tunnelArgs.join(' ').includes('127.0.0.1:40123:127.0.0.1:39080'),
+  )
+  check(
+    'buildSshArgs carries no launch command',
+    !tunnelArgs.join(' ').includes('dsh') && !tunnelArgs.join(' ').includes('sh -c'),
+    tunnelArgs.join(' '),
+  )
+  check('buildSshArgs keeps SSH keepalive options', tunnelArgs.join(' ').includes('ServerAliveInterval=15'))
+  const keyArgs = module.buildSshArgs({ ...tunnelHost, identityFile: '~/.ssh/k.pem' }, 40124, 39080)
+  check(
+    'buildSshArgs passes identityFile with -i and expands ~',
+    keyArgs.includes('-i') &&
+      keyArgs.some((arg) => arg.replaceAll('\\', '/').endsWith('.ssh/k.pem') && !arg.startsWith('~')),
+    keyArgs.join(' '),
+  )
+  check('isDetachedLaunch is no longer exported', !('isDetachedLaunch' in module))
+
+  const stopScript = module.buildRemoteStopScript(39080)
+  check('stop script targets the configured port', stopScript.startsWith('PORT=39080'), stopScript.split('\n')[0])
+  check(
+    'stop script reports STOPPED=',
+    stopScript.includes('STOPPED=') && stopScript.includes('STOPPED=$FOUND'),
+  )
+  check('stop script has a kill -9 fallback', stopScript.includes('kill -9'))
+  check('stop script only ends dsh processes', stopScript.includes('grep -q dsh'))
+
+  const launchCommand = 'dsh --profile web --port 39080 --no-open'
+  const launchScript = module.buildRemoteDetachedLaunchScript(39080, launchCommand)
+  check('launch script uses the configured port', launchScript.startsWith('PORT=39080'))
+  check('launch script reuses a running dsh (REUSE=1)', launchScript.includes('REUSE=1'))
+  check('launch script reports a busy non-dsh port (FAILED=port-busy)', launchScript.includes('FAILED=port-busy'))
+  check('launch script detaches with setsid nohup sh -c', launchScript.includes('setsid nohup sh -c'))
+  check('launch script embeds the launch command', launchScript.includes(launchCommand))
+
   module.apply(first.context)
   const { server, base } = await serve(first.routes)
   const prefix = '/remote-desktop/api'
@@ -226,111 +289,201 @@ async function main() {
     )
     check('state hosts empty', initial.payload.hosts.length === 0)
 
-    // 3. 校验
-    const badMode = await call(base, 'POST', `${prefix}/hosts`, { host: { mode: 'ssh' } })
-    check('invalid mode → 400', badMode.status === 400)
-    const badPort = await call(base, 'POST', `${prefix}/hosts`, {
-      host: { mode: 'launch', host: 'example.com', port: 70000 },
+    // 3. 校验：host 必填且只校验 SSH 字段；旧字段不再参与校验
+    const missingHost = await call(base, 'POST', `${prefix}/hosts`, { host: { name: 'No Host', mode: 'ssh' } })
+    check(
+      'missing host → 400',
+      missingHost.status === 400 && missingHost.payload?.ok === false,
+      JSON.stringify(missingHost.payload),
+    )
+    const missingHostBody = await call(base, 'POST', `${prefix}/hosts`, {})
+    check('missing host body → 400', missingHostBody.status === 400)
+    const blankHost = await call(base, 'POST', `${prefix}/hosts`, { host: { name: 'Blank', host: '   ' } })
+    check('blank host → 400', blankHost.status === 400)
+    const badPort = await call(base, 'POST', `${prefix}/hosts`, { host: { host: 'example.com', port: 70000 } })
+    check('invalid SSH port → 400', badPort.status === 400)
+    const nonNumericPort = await call(base, 'POST', `${prefix}/hosts`, {
+      host: { host: 'example.com', port: 'notaport' },
     })
-    check('invalid port → 400', badPort.status === 400)
-    const badUrl = await call(base, 'POST', `${prefix}/hosts`, { host: { mode: 'url', url: 'ftp://x' } })
-    check('invalid url protocol → 400', badUrl.status === 400)
-
-    // 4. 新建 url 模式主机并持久化
-    const created = await call(base, 'POST', `${prefix}/hosts`, {
-      host: { name: 'Local UI', mode: 'url', url: 'http://127.0.0.1:9/' },
+    check('non-numeric SSH port → 400', nonNumericPort.status === 400)
+    const badRemotePort = await call(base, 'POST', `${prefix}/hosts`, {
+      host: { host: 'example.com', remotePort: 0 },
     })
-    check('create host', created.status === 200 && typeof created.payload?.host?.id === 'string')
-    const id = created.payload.host.id
-    const store = JSON.parse(await readFile(join(home, 'remote-desktop.json'), 'utf8'))
-    check('store persisted', store.version === 1 && store.hosts.some((host) => host.id === id))
+    check('invalid remotePort → 400', badRemotePort.status === 400)
 
-    // 4b. launch 模式：installCommand 默认值 / 自定义值持久化 / 非 launch 模式忽略
-    const launchHost = await call(base, 'POST', `${prefix}/hosts`, {
-      host: { name: 'Auto Install', mode: 'launch', host: 'example.com' },
+    // mode=ssh 不再单独报错：旧字段被忽略，host 合法就 200
+    const modeSsh = await call(base, 'POST', `${prefix}/hosts`, {
+      host: { name: 'Mode SSH', host: 'mode-ssh.example.com', mode: 'ssh' },
     })
     check(
-      'launch host default installCommand',
-      launchHost.status === 200 && launchHost.payload?.host?.installCommand === 'npm install -g @deepseek-ai/dsh',
-      JSON.stringify(launchHost.payload),
+      'legacy mode=ssh accepted and ignored',
+      modeSsh.status === 200 &&
+        modeSsh.payload?.host?.host === 'mode-ssh.example.com' &&
+        modeSsh.payload?.host?.mode === undefined &&
+        hasExactHostViewFields(modeSsh.payload?.host),
+      JSON.stringify(modeSsh.payload),
     )
-    const launchId = launchHost.payload?.host?.id
-    const customInstall = await call(base, 'POST', `${prefix}/hosts`, {
+    const removedModeSsh = await call(base, 'POST', `${prefix}/hosts/delete`, { id: modeSsh.payload?.host?.id })
+    check('legacy mode host deleted', removedModeSsh.status === 200)
+
+    // 4. 旧字段被忽略：HostView 恰好 8 个字段，只保留 SSH 目标
+    const legacy = await call(base, 'POST', `${prefix}/hosts`, {
       host: {
-        id: launchId,
-        name: 'Auto Install',
-        mode: 'launch',
+        name: 'Legacy Fields',
         host: 'example.com',
-        installCommand: 'apt-get install -y dsh',
+        mode: 'attach',
+        url: 'http://x',
+        token: 't',
+        keepRemoteRunning: false,
+        launchCommand: 'x',
+        installCommand: 'y',
       },
     })
-    check('custom installCommand persisted', customInstall.payload?.host?.installCommand === 'apt-get install -y dsh')
-    const urlHostInstall = await call(base, 'POST', `${prefix}/hosts`, {
-      host: { id, name: 'Local UI', mode: 'url', url: 'http://127.0.0.1:9/', installCommand: 'ignored' },
-    })
-    check('installCommand cleared for non-launch mode', urlHostInstall.payload?.host?.installCommand === '')
-
-    // 4c. 保持远端运行（keepRemoteRunning）：默认 true / 可显式关闭 / 非 launch 强制 false / 持久化
-    const keepDefault = await call(base, 'POST', `${prefix}/hosts`, {
-      host: { name: 'Keep Default', mode: 'launch', host: 'example.com' },
-    })
-    check('keepRemoteRunning defaults true', keepDefault.payload?.host?.keepRemoteRunning === true)
-    const keepId = keepDefault.payload?.host?.id
-    const keepOff = await call(base, 'POST', `${prefix}/hosts`, {
-      host: { id: keepId, name: 'Keep Off', mode: 'launch', host: 'example.com', keepRemoteRunning: false },
-    })
-    check('keepRemoteRunning can be turned off', keepOff.payload?.host?.keepRemoteRunning === false)
-    const keepStore = JSON.parse(await readFile(join(home, 'remote-desktop.json'), 'utf8'))
+    check('host with legacy fields accepted → 200', legacy.status === 200 && legacy.payload?.ok === true)
+    const legacyHost = legacy.payload?.host ?? {}
+    const legacyKeys = Object.keys(legacyHost).sort()
     check(
-      'keepRemoteRunning persisted',
-      keepStore.hosts.find((host) => host.id === keepId)?.keepRemoteRunning === false,
+      'HostView has exactly 8 fields',
+      hasExactHostViewFields(legacyHost) &&
+        JSON.stringify(legacyKeys) === JSON.stringify(HOST_VIEW_FIELDS_SORTED),
+      legacyKeys.join(','),
     )
-    const keepOn = await call(base, 'POST', `${prefix}/hosts`, {
-      host: { id: keepId, name: 'Keep On', mode: 'launch', host: 'example.com', keepRemoteRunning: true },
-    })
-    check('keepRemoteRunning enabled on launch host', keepOn.payload?.host?.keepRemoteRunning === true)
-    const keeplessAttach = await call(base, 'POST', `${prefix}/hosts`, {
-      host: { name: 'Keep Attach', mode: 'attach', host: 'example.com', keepRemoteRunning: true },
-    })
-    check('keepRemoteRunning cleared for non-launch mode', keeplessAttach.payload?.host?.keepRemoteRunning === false)
-    await call(base, 'POST', `${prefix}/hosts/delete`, { id: keepId })
-    await call(base, 'POST', `${prefix}/hosts/delete`, { id: keeplessAttach.payload?.host?.id })
-    await call(base, 'POST', `${prefix}/hosts/delete`, { id: launchId })
-
-    // 5. 连接状态机（url 模式立即 connected）
-    const connected = await call(base, 'POST', `${prefix}/connect`, { id })
-    check('connect accepted', connected.status === 200 && connected.payload?.ok === true)
-    const afterConnect = await call(base, 'GET', `${prefix}/state`)
-    const view = afterConnect.payload.active[id]
     check(
-      'url mode connected',
-      view?.status === 'connected' && view?.url === 'http://127.0.0.1:9/',
-      JSON.stringify(view),
+      'HostView includes id and updatedAt',
+      typeof legacyHost.id === 'string' && typeof legacyHost.updatedAt === 'string' && !Number.isNaN(Date.parse(legacyHost.updatedAt)),
+    )
+    check(
+      'legacy fields are not in HostView',
+      LEGACY_HOST_FIELDS.every((key) => !Object.prototype.hasOwnProperty.call(legacyHost, key)),
+      LEGACY_HOST_FIELDS.filter((key) => Object.prototype.hasOwnProperty.call(legacyHost, key)).join(','),
+    )
+    check(
+      'legacy host keeps only the SSH target',
+      legacyHost.name === 'Legacy Fields' &&
+        legacyHost.host === 'example.com' &&
+        legacyHost.port === 22 &&
+        legacyHost.user === '' &&
+        legacyHost.identityFile === '' &&
+        legacyHost.remotePort === 39080,
+      JSON.stringify(legacyHost),
+    )
+    const removedLegacy = await call(base, 'POST', `${prefix}/hosts/delete`, { id: legacyHost.id })
+    check('legacy host deleted', removedLegacy.status === 200)
+
+    // 5. 新建 SSH 主机并持久化
+    const created = await call(base, 'POST', `${prefix}/hosts`, {
+      host: {
+        name: 'Prod',
+        host: 'prod.example.com',
+        port: 2222,
+        user: 'root',
+        identityFile: '~/.ssh/id_ed25519',
+        remotePort: 39082,
+      },
+    })
+    check(
+      'create SSH host',
+      created.status === 200 && typeof created.payload?.host?.id === 'string',
+      JSON.stringify(created.payload),
+    )
+    const id = created.payload?.host?.id
+    check('created host is a HostView', hasExactHostViewFields(created.payload?.host))
+    check(
+      'created host normalizes the SSH target',
+      created.payload?.host?.name === 'Prod' &&
+        created.payload?.host?.host === 'prod.example.com' &&
+        created.payload?.host?.port === 2222 &&
+        created.payload?.host?.user === 'root' &&
+        created.payload?.host?.identityFile === '~/.ssh/id_ed25519' &&
+        created.payload?.host?.remotePort === 39082,
+      JSON.stringify(created.payload?.host),
+    )
+    const store = JSON.parse(await readFile(join(home, 'remote-desktop.json'), 'utf8'))
+    check('store persisted', store.version === 1 && store.hosts.some((host) => host.id === id))
+    const storedHost = store.hosts.find((host) => host.id === id)
+    check(
+      'stored host is a HostView',
+      storedHost !== undefined &&
+        Object.keys(storedHost).length === 8 &&
+        storedHost.host === 'prod.example.com' &&
+        storedHost.port === 2222 &&
+        storedHost.user === 'root' &&
+        storedHost.identityFile === '~/.ssh/id_ed25519' &&
+        storedHost.remotePort === 39082,
+      JSON.stringify(storedHost),
     )
 
     // 6. 编辑保留 id
     const edited = await call(base, 'POST', `${prefix}/hosts`, {
-      host: { id, name: 'Renamed', mode: 'url', url: 'http://127.0.0.1:9/' },
+      host: {
+        id,
+        name: 'Renamed',
+        host: 'prod2.example.com',
+        port: 2223,
+        user: 'deploy',
+        identityFile: '~/.ssh/deploy_key',
+        remotePort: 39083,
+      },
     })
-    check('edit keeps id', edited.payload?.host?.id === id && edited.payload.host.name === 'Renamed')
+    check(
+      'edit keeps id',
+      edited.payload?.host?.id === id && edited.payload?.host?.name === 'Renamed',
+      JSON.stringify(edited.payload),
+    )
+    check(
+      'edit applies the SSH fields',
+      edited.payload?.host?.host === 'prod2.example.com' &&
+        edited.payload?.host?.port === 2223 &&
+        edited.payload?.host?.user === 'deploy' &&
+        edited.payload?.host?.identityFile === '~/.ssh/deploy_key' &&
+        edited.payload?.host?.remotePort === 39083,
+      JSON.stringify(edited.payload?.host),
+    )
+    const storeAfterEdit = JSON.parse(await readFile(join(home, 'remote-desktop.json'), 'utf8'))
+    const storedAfterEdit = storeAfterEdit.hosts.find((host) => host.id === id)
+    check(
+      'edit persisted without duplicating hosts',
+      storeAfterEdit.hosts.length === 1 &&
+        storedAfterEdit?.name === 'Renamed' &&
+        storedAfterEdit?.host === 'prod2.example.com' &&
+        storedAfterEdit?.port === 2223 &&
+        storedAfterEdit?.user === 'deploy' &&
+        storedAfterEdit?.remotePort === 39083,
+      JSON.stringify(storedAfterEdit),
+    )
 
-    // 7. 断开
+    // 7. 断开未连接的主机（纯本地路径，不拉起 ssh）
     const disconnected = await call(base, 'POST', `${prefix}/disconnect`, { id })
-    check('disconnect accepted', disconnected.status === 200)
-    const afterDisconnect = await call(base, 'GET', `${prefix}/state`)
-    check('disconnected view', afterDisconnect.payload.active[id]?.status === 'disconnected')
+    check('disconnect idle host accepted', disconnected.status === 200 && disconnected.payload?.ok === true)
+    const stateAfterDisconnect = await call(base, 'GET', `${prefix}/state`)
+    check('disconnect keeps the host in state', stateAfterDisconnect.payload.hosts.some((host) => host.id === id))
+    check(
+      'disconnect does not fabricate a connection',
+      stateAfterDisconnect.payload.active[id] === undefined && Object.keys(stateAfterDisconnect.payload.active).length === 0,
+      JSON.stringify(stateAfterDisconnect.payload.active),
+    )
 
-    // 8. 测试端点（url 模式无需 SSH）
-    const tested = await call(base, 'POST', `${prefix}/test`, { id })
-    check('test url mode', tested.status === 200 && tested.payload?.ok === true)
-
-    // 9. 未知路由 / 未知 id
+    // 8. 未知路由 / 未知 id：所有连接类接口只在本地查表，不会真的拉起 ssh
     const unknown = await call(base, 'GET', `${prefix}/nope`)
     check('unknown endpoint → 404', unknown.status === 404)
-    const missing = await call(base, 'POST', `${prefix}/connect`, { id: 'missing' })
-    check('unknown id → 404', missing.status === 404)
+    const connectMissing = await call(base, 'POST', `${prefix}/connect`, { id: 'missing' })
+    check('connect unknown id → 404', connectMissing.status === 404 && connectMissing.payload?.ok === false)
+    const disconnectMissing = await call(base, 'POST', `${prefix}/disconnect`, { id: 'missing' })
+    check('disconnect unknown id → 404', disconnectMissing.status === 404)
+    const testMissing = await call(base, 'POST', `${prefix}/test`, { id: 'missing' })
+    check('test unknown id → 404', testMissing.status === 404)
+    const stopMissing = await call(base, 'POST', `${prefix}/stop`, { id: 'missing' })
+    check('stop unknown id → 404', stopMissing.status === 404 && stopMissing.payload?.ok === false)
+    const stopNoId = await call(base, 'POST', `${prefix}/stop`, {})
+    check('stop without id → 404', stopNoId.status === 404)
+    const anonymousStop = await call(base, 'POST', `${prefix}/stop`, { id: 'missing' }, '')
+    check('stop unauthenticated → 401', anonymousStop.status === 401)
+    const restartMissing = await call(base, 'POST', `${prefix}/restart`, { id: 'missing' })
+    check('restart unknown id → 404', restartMissing.status === 404 && restartMissing.payload?.ok === false)
+    const deleteMissing = await call(base, 'POST', `${prefix}/hosts/delete`, { id: 'missing' })
+    check('delete unknown id → 404', deleteMissing.status === 404)
 
-    // 9b. 本机打开浏览器：只校验入参拒绝逻辑（有效链接会真的拉起浏览器，冒烟测试不触发）
+    // 8b. 本机打开浏览器：只校验入参拒绝逻辑（有效链接会真的拉起浏览器，冒烟测试不触发）
     const anonymousOpen = await call(base, 'POST', `${prefix}/open-url`, { url: 'https://platform.deepseek.com/dsh/authorize' }, '')
     check('open-url unauthenticated → 401', anonymousOpen.status === 401)
     const missingUrl = await call(base, 'POST', `${prefix}/open-url`, {})
@@ -342,19 +495,13 @@ async function main() {
     const withCredentials = await call(base, 'POST', `${prefix}/open-url`, { url: 'https://user:pass@example.com/x' })
     check('open-url rejects credentials → 400', withCredentials.status === 400)
 
-    // 9c. 重启远端：url 模式没有远端进程 → 400；未知 id → 404
-    const restartUrlMode = await call(base, 'POST', `${prefix}/restart`, { id })
-    check('restart url mode → 400', restartUrlMode.status === 400)
-    const restartMissing = await call(base, 'POST', `${prefix}/restart`, { id: 'missing' })
-    check('restart unknown id → 404', restartMissing.status === 404)
-
-    // 10. 删除
+    // 9. 删除
     const removed = await call(base, 'POST', `${prefix}/hosts/delete`, { id })
     check('delete host', removed.status === 200)
     const afterDelete = await call(base, 'GET', `${prefix}/state`)
     check('state empty after delete', afterDelete.payload.hosts.length === 0 && !afterDelete.payload.active[id])
 
-    // 11. 本地 SSH 自动发现（GET /discover）
+    // 10. 本地 SSH 自动发现（GET /discover）
     const anonymousDiscover = await call(base, 'GET', `${prefix}/discover`, undefined, '')
     check('discover unauthenticated → 401', anonymousDiscover.status === 401)
 
@@ -509,7 +656,7 @@ async function main() {
     // imported：与已保存 host 的匹配（host + port + user）
     check('imported false before save', byName('plain.example.com')?.imported === false)
     const savedCandidate = await call(base, 'POST', `${prefix}/hosts`, {
-      host: { name: 'Plain known', mode: 'launch', host: 'plain.example.com' },
+      host: { name: 'Plain known', host: 'plain.example.com' },
     })
     check(
       'save candidate host',
@@ -583,22 +730,98 @@ async function main() {
     )
     process.env.DSH_REMOTE_DESKTOP_SSH_DIR = sshDir
 
-    // 12. 重新加载插件实例：配置从同一 DSH_HOME 恢复
-    await call(base, 'POST', `${prefix}/hosts`, {
-      host: { name: 'Restored', mode: 'url', url: 'http://127.0.0.1:9/' },
-    })
+    // 11. 重新加载插件实例：旧 config（mode=launch/attach 且带 host）恢复为 SSH HostView，
+    //     坏记录（缺 host / 非对象）被丢弃。
+    const reloadStore = {
+      version: 1,
+      hosts: [
+        {
+          id: 'legacy-launch',
+          name: 'Legacy Launch',
+          mode: 'launch',
+          host: 'legacy-launch.example.com',
+          port: 2201,
+          user: 'legacy',
+          identityFile: '~/.ssh/legacy',
+          remotePort: 39090,
+          installCommand: 'ignored',
+          keepRemoteRunning: true,
+          updatedAt: '2024-01-01T00:00:00.000Z',
+        },
+        {
+          id: 'legacy-attach',
+          name: 'Legacy Attach',
+          mode: 'attach',
+          host: 'legacy-attach.example.com',
+          port: 2202,
+          user: 'attach',
+          remotePort: 39091,
+        },
+        { id: 'bad-no-host', name: 'Bad No Host', mode: 'launch', port: 2203 },
+        null,
+        'garbage',
+      ],
+    }
+    await writeFile(join(home, 'remote-desktop.json'), `${JSON.stringify(reloadStore, null, 2)}\n`, 'utf8')
     server.close()
     const second = createFakeContext()
     const reloaded = await import(`${PLUGIN}?reload=1`)
     reloaded.apply(second.context)
     const restoredServer = await serve(second.routes)
     const restored = await call(restoredServer.base, 'GET', `${prefix}/state`)
+    const restoredHosts = restored.payload?.hosts ?? []
+    const restoredById = (hostId) => restoredHosts.find((host) => host.id === hostId)
+
     check(
-      'hosts restored after reload',
-      restored.payload.hosts.length === 1 && restored.payload.hosts[0].name === 'Restored',
+      'legacy configs restored, bad records dropped',
+      restored.status === 200 &&
+        restoredHosts.length === 2 &&
+        restoredById('legacy-launch') !== undefined &&
+        restoredById('legacy-attach') !== undefined &&
+        restoredById('bad-no-host') === undefined &&
+        restoredHosts.every((host) => host.name !== 'Bad No Host'),
+      JSON.stringify(restoredHosts.map((host) => host.id)),
+    )
+    check(
+      'restored host views have exactly 8 fields',
+      restoredHosts.length > 0 && restoredHosts.every((host) => hasExactHostViewFields(host)),
+      JSON.stringify(restoredHosts.map((host) => Object.keys(host))),
+    )
+    check(
+      'legacy fields dropped on restore',
+      restoredHosts.every(
+        (host) =>
+          !Object.prototype.hasOwnProperty.call(host, 'mode') &&
+          !Object.prototype.hasOwnProperty.call(host, 'installCommand') &&
+          !Object.prototype.hasOwnProperty.call(host, 'keepRemoteRunning'),
+      ),
+    )
+    check(
+      'legacy launch config keeps its SSH target',
+      restoredById('legacy-launch')?.name === 'Legacy Launch' &&
+        restoredById('legacy-launch')?.host === 'legacy-launch.example.com' &&
+        restoredById('legacy-launch')?.port === 2201 &&
+        restoredById('legacy-launch')?.user === 'legacy' &&
+        restoredById('legacy-launch')?.identityFile === '~/.ssh/legacy' &&
+        restoredById('legacy-launch')?.remotePort === 39090,
+      JSON.stringify(restoredById('legacy-launch')),
+    )
+    check(
+      'legacy attach config restored',
+      restoredById('legacy-attach')?.host === 'legacy-attach.example.com' &&
+        restoredById('legacy-attach')?.port === 2202 &&
+        restoredById('legacy-attach')?.user === 'attach' &&
+        restoredById('legacy-attach')?.remotePort === 39091,
+      JSON.stringify(restoredById('legacy-attach')),
+    )
+    check(
+      'restored updatedAt kept/generated',
+      restoredById('legacy-launch')?.updatedAt === '2024-01-01T00:00:00.000Z' &&
+        typeof restoredById('legacy-attach')?.updatedAt === 'string' &&
+        !Number.isNaN(Date.parse(restoredById('legacy-attach')?.updatedAt)),
     )
 
-    // 13. 卸载清理不抛错
+    // 12. 卸载清理不抛错
     for (const dispose of second.disposers.reverse()) await dispose()
     check('dispose clean', true)
     restoredServer.server.close()

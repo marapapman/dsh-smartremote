@@ -124,7 +124,7 @@ check('registers en dictionary', Array.isArray(en?.keys) && en.keys.length > 0)
 const onlyZh = zh.keys.filter((key) => !en.keys.includes(key))
 const onlyEn = en.keys.filter((key) => !zh.keys.includes(key))
 check('ZH/EN dictionaries have identical keys', onlyZh.length === 0 && onlyEn.length === 0, `${onlyZh} / ${onlyEn}`)
-check('dictionary key count', zh.keys.length === en.keys.length && zh.keys.length >= 99, String(zh.keys.length))
+check('dictionary key count', zh.keys.length === en.keys.length && zh.keys.length >= 112, String(zh.keys.length))
 
 check('effect cleanup registered', effects.length >= 3 && effects.some((entry) => typeof entry.dispose === 'function'))
 
