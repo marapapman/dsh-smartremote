@@ -40,7 +40,7 @@ const INSTALL_TIMEOUT_MS = 600_000
 const SETUP_PROBE_TIMEOUT_MS = 25_000
 const PROBE_TIMEOUT_MS = 3_000
 const PROBE_INTERVAL_MS = 750
-const TEST_TIMEOUT_MS = 12_000
+const TEST_TIMEOUT_MS = 60_000
 const KILL_GRACE_MS = 2_000
 const COMMAND_TIMEOUT_MS = 5_000
 
@@ -612,63 +612,86 @@ function buildRemoteCommandArgs(host, command) {
 }
 
 /**
- * 单次远端命令：输出实时写入连接日志，返回 { code, stdout }。
- * 超时/进程错误时 code 为 null；取消（连接被断开）由调用方检查 conn.status。
+ * 单次远端命令：stdout/stderr 分开保留，合并的 output 实时写入连接日志。
+ * 超时/进程错误时 code 为 null，并保留 error；取消由调用方检查 conn.status。
+ * 等 close 而非 exit，确保最后一段输出已读取，协议标记只能来自 stdout。
  */
 function runRemoteStep(conn, sshPath, args, timeoutMs) {
   return new Promise((resolve) => {
     let settled = false
+    let stdout = ''
+    let stderr = ''
     let output = ''
     let child = null
     let timer = null
-    const finish = (code) => {
+    const finish = (code, error = null) => {
       if (settled) return
       settled = true
-      // 成功/失败都要清掉超时定时器：否则步骤早已完成，定时器仍会在 25s/75s 后
-      // 打印「步骤超时」，让人误以为连接在反复失败（曾据此误判过重连抖动）。
+      // 成功/失败都清掉超时定时器，避免步骤结束后出现「幽灵步骤超时」。
       if (timer !== null) {
         clearTimeout(timer)
         timer = null
       }
       if (child && conn.child === child) conn.child = null
-      resolve({ code, stdout: output })
+      resolve({ code, stdout, stderr, output, error })
     }
     try {
       child = spawn(sshPath, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
     } catch (error) {
       appendLogLine(conn, `[setup] 无法启动 ssh：${toMessage(error)}`)
-      finish(null)
+      finish(null, toMessage(error))
       return
     }
     trackChild(conn, child)
     child.stdout?.setEncoding('utf8')
     child.stderr?.setEncoding('utf8')
-    const collect = (chunk) => {
+    const collect = (chunk, isStderr) => {
       const text = String(chunk ?? '')
-      if (!text) return
-      output += text
-      if (output.length > MAX_TEST_OUTPUT) output = output.slice(-MAX_TEST_OUTPUT)
+      if (!text || settled) return
+      if (isStderr) stderr = (stderr + text).slice(-MAX_TEST_OUTPUT)
+      else stdout = (stdout + text).slice(-MAX_TEST_OUTPUT)
+      output = (output + text).slice(-MAX_TEST_OUTPUT)
       appendLogText(conn, text)
     }
-    child.stdout?.on('data', collect)
-    child.stderr?.on('data', collect)
+    child.stdout?.on('data', (chunk) => collect(chunk, false))
+    child.stderr?.on('data', (chunk) => collect(chunk, true))
     child.on('error', (error) => {
       appendLogLine(conn, `[setup] ssh 进程错误：${toMessage(error)}`)
-      finish(null)
+      finish(null, toMessage(error))
     })
-    child.on('exit', (code) => {
+    child.on('close', (code, signal) => {
       flushLineBuffer(conn)
-      finish(typeof code === 'number' ? code : null)
+      finish(typeof code === 'number' ? code : null, signal ? `signal ${signal}` : null)
     })
     timer = setTimeout(() => {
       timer = null
       if (settled) return
-      appendLogLine(conn, `[setup] 步骤超时（约 ${Math.round(timeoutMs / 1000)} 秒）`)
+      const error = `步骤超时（约 ${Math.round(timeoutMs / 1000)} 秒）`
+      appendLogLine(conn, `[setup] ${error}`)
       killProcessTree(child)
-      finish(null)
+      finish(null, error)
     }, timeoutMs)
     if (typeof timer.unref === 'function') timer.unref()
   })
+}
+
+/** 仅接受成功 SSH 命令 stdout 中唯一的完整状态行；其它结果不能证明 dsh 缺失。 */
+function parseRemoteDshCheck(step) {
+  if (step?.code !== 0 || step.error) return 'failed'
+  const markers = String(step.stdout ?? '').split(/\r?\n/).filter((line) => line === 'DSH_OK' || line === 'DSH_MISSING')
+  if (markers.length !== 1) return 'failed'
+  return markers[0] === 'DSH_OK' ? 'installed' : 'missing'
+}
+
+/** 保留原始 SSH 错误/进程状态，脱敏并限制 UI 中显示的诊断长度。 */
+function remoteStepFailureDetail(step) {
+  const status = step?.code === 0
+    ? 'SSH 命令已退出，但未返回有效状态标记'
+    : `SSH 命令未成功完成（${formatExit(step?.code)}）`
+  const cause = step?.error ? `：${sanitizeOutputText(step.error)}` : ''
+  const output = step?.output ?? `${step?.stdout ?? ''}\n${step?.stderr ?? ''}`
+  const tail = sanitizeOutputText(output).trim().split(/\r?\n/).filter(Boolean).slice(-8).join('\n')
+  return `${status}${cause}${tail ? `\n最近输出：\n${tail}` : ''}`
 }
 
 /**
@@ -855,22 +878,51 @@ function buildRemoteDetachedLaunchScript(port, launchCommand) {
  * 成功后设置 conn.remotePort 与 conn.token。
  */
 function parseDetachedLaunchResult(stdout) {
-  return {
-    reuse: /REUSE=1/.test(stdout),
-    token: (/TOKEN=([^\s]+)/.exec(stdout) ?? [])[1] ?? null,
-    failed: (/FAILED=([a-z-]+)/.exec(stdout) ?? [])[1] ?? null,
+  const unknown = { reuse: false, token: null, failed: null, started: false }
+  const fields = { reuse: [], token: [], failed: [], pid: [] }
+  for (const line of String(stdout ?? '').split(/\r?\n/)) {
+    const marker = /^(REUSE|TOKEN|FAILED)=(.*)$|^(PID):(.*)$/.exec(line)
+    if (marker === null) continue
+    fields[(marker[1] ?? marker[3]).toLowerCase()].push(marker[2] ?? marker[4])
   }
+  // 不取「第一个看起来像标记的子串」：重复、格式错误和冲突状态都视为未知。
+  if (Object.values(fields).some((values) => values.length > 1)) return unknown
+  const reuse = fields.reuse[0]
+  const token = fields.token[0]
+  const failed = fields.failed[0]
+  const pid = fields.pid[0]
+  if (reuse !== undefined && reuse !== '0' && reuse !== '1') return unknown
+  if (token !== undefined && !/^\S+$/.test(token)) return unknown
+  if (pid !== undefined && !/^[1-9]\d*$/.test(pid)) return unknown
+  const started = pid !== undefined
+  if (failed !== undefined) {
+    if (!['port-busy', 'reuse-no-token', 'no-token'].includes(failed)) return unknown
+    if (token !== undefined || reuse !== undefined || (started && failed !== 'no-token')) return unknown
+    return { ...unknown, failed, started }
+  }
+  if (token === undefined || reuse === undefined) return unknown
+  if ((reuse === '1' && started) || (reuse === '0' && !started)) return unknown
+  return { reuse: reuse === '1', token, failed: null, started }
 }
 
-async function prepareDetachedRemoteDsh(conn, sshPath) {
+async function prepareDetachedRemoteDsh(conn, sshPath, runStep = runRemoteStep, cleanupRemote = killRemoteDshOnPort) {
   const port = conn.host.remotePort
   const launchCommand = DEFAULT_LAUNCH_COMMAND.replaceAll('{port}', String(port))
   const launchArgs = buildRemoteCommandArgs(
     conn.host,
     encodeRemoteScript(buildRemoteDetachedLaunchScript(port, launchCommand)),
   )
-  let step = await runRemoteStep(conn, sshPath, launchArgs, SETUP_PROBE_TIMEOUT_MS * 3)
-  if (conn.status !== 'connecting') return false
+  const stepSucceeded = (step) => {
+    if (step?.code === 0 && !step.error) return true
+    failConnection(
+      conn,
+      `SSH 执行远端 dsh 准备命令失败，无法确认远端状态；不会自动清理远端进程。\n${remoteStepFailureDetail(step)}`,
+      '[setup] SSH 远端准备命令失败',
+    )
+    return false
+  }
+  let step = await runStep(conn, sshPath, launchArgs, SETUP_PROBE_TIMEOUT_MS * 3)
+  if (conn.status !== 'connecting' || !stepSucceeded(step)) return false
   let result = parseDetachedLaunchResult(step.stdout)
 
   // 迁移场景：端口上有一个 dsh，但它不是以常驻模式启动的（日志里没有令牌，例如
@@ -880,15 +932,15 @@ async function prepareDetachedRemoteDsh(conn, sshPath) {
       conn,
       `[setup] 远端端口 ${port} 上的 dsh 不是常驻模式启动的（没有令牌记录），正在重启为常驻模式`,
     )
-    await runRemoteStep(
+    const restart = await runStep(
       conn,
       sshPath,
       buildRemoteCommandArgs(conn.host, encodeRemoteScript(buildRemoteRestartScript(port))),
       SETUP_PROBE_TIMEOUT_MS * 2,
     )
-    if (conn.status !== 'connecting') return false
-    step = await runRemoteStep(conn, sshPath, launchArgs, SETUP_PROBE_TIMEOUT_MS * 3)
-    if (conn.status !== 'connecting') return false
+    if (conn.status !== 'connecting' || !stepSucceeded(restart)) return false
+    step = await runStep(conn, sshPath, launchArgs, SETUP_PROBE_TIMEOUT_MS * 3)
+    if (conn.status !== 'connecting' || !stepSucceeded(step)) return false
     result = parseDetachedLaunchResult(step.stdout)
   }
 
@@ -899,7 +951,7 @@ async function prepareDetachedRemoteDsh(conn, sshPath) {
       conn,
       result.reuse
         ? `[setup] 检测到远端已在运行的 dsh（端口 ${port}），直接接入，此前任务继续运行`
-        : `[setup] 远端未检测到 dsh，已在后台常驻启动（端口 ${port}，日志 ${REMOTE_LAUNCH_LOG}）`,
+        : `[setup] 远端未检测到运行中的 dsh，已在后台常驻启动（端口 ${port}，日志 ${REMOTE_LAUNCH_LOG}）`,
     )
     return true
   }
@@ -910,9 +962,11 @@ async function prepareDetachedRemoteDsh(conn, sshPath) {
       ? `远端端口 ${port} 被其他进程占用。请把该主机的「远端端口」改成别的端口，或先在远端结束占用该端口的进程。`
       : code === 'reuse-no-token'
         ? `远端端口 ${port} 上已有一个 dsh，但 ${REMOTE_LAUNCH_LOG} 里没有它的访问令牌，重启后仍未拿到令牌。请查看远端日志 ${REMOTE_LAUNCH_LOG}。`
-        : `远端 dsh 在后台启动后没有输出访问令牌。请查看远端日志 ${REMOTE_LAUNCH_LOG}。`
-  // 仅当本次确实新起了一个进程时才清理，复用的进程绝不杀。
-  if (!result.reuse) killRemoteDshOnPort(conn.host, port)
+        : code === 'no-token' && result.started
+          ? `远端 dsh 在后台启动后没有输出访问令牌。请查看远端日志 ${REMOTE_LAUNCH_LOG}。`
+          : `远端准备命令未返回有效状态或访问令牌；无法确认远端 dsh 状态。\n${remoteStepFailureDetail(step)}`
+  // 只有脚本明确返回本次新起的 PID 才清理；SSH 失败/未知输出不能证明启动过进程。
+  if (result.started && result.failed === 'no-token' && !result.reuse) cleanupRemote(conn.host, port)
   failConnection(conn, `启动远端 dsh 失败：${reason}`, `[setup] 后台启动失败（${code}）`)
   return false
 }
@@ -976,57 +1030,71 @@ function runRemoteScriptOnce(host, sshPath, script, timeoutMs) {
  * 首次连接探测远端 dsh；缺失时自动安装（npm install -g @deepseek-ai/dsh）。
  * 返回 true 表示可以继续启动；失败时已通过 failConnection 设置连接错误。
  */
-async function ensureRemoteDsh(conn, sshPath) {
-  const check = await runRemoteStep(
+async function ensureRemoteDsh(conn, sshPath, runStep = runRemoteStep) {
+  const check = await runStep(
     conn,
     sshPath,
     buildRemoteCommandArgs(conn.host, REMOTE_DSH_CHECK_COMMAND),
     SETUP_PROBE_TIMEOUT_MS,
   )
   if (conn.status !== 'connecting') return false
-  if (check.code === 0 && check.stdout.includes('DSH_OK')) {
+  const state = parseRemoteDshCheck(check)
+  if (state === 'installed') {
     appendLogLine(conn, '[setup] 远端已安装 dsh')
     return true
   }
-  if (check.code === null) {
-    failConnection(conn, 'SSH 连接失败：无法在远端执行探测命令。', '[setup] 探测 dsh 失败')
+  if (state !== 'missing') {
+    failConnection(
+      conn,
+      `SSH 探测远端 dsh 失败，无法确认是否已安装 dsh；已停止自动安装。\n${remoteStepFailureDetail(check)}`,
+      '[setup] SSH 探测 dsh 失败，未执行自动安装',
+    )
     return false
   }
 
   const installCommand = DEFAULT_INSTALL_COMMAND
-  appendLogLine(conn, `[setup] 远端未检测到 dsh，开始自动安装：${installCommand}`)
-  const install = await runRemoteStep(
+  appendLogLine(conn, `[setup] 已确认远端 SSH 会话中未找到 dsh 命令，开始自动安装：${installCommand}`)
+  const install = await runStep(
     conn,
     sshPath,
     buildRemoteCommandArgs(conn.host, installCommand),
     INSTALL_TIMEOUT_MS,
   )
   if (conn.status !== 'connecting') return false
-  if (install.code !== 0) {
-    const tail = install.stdout.trim().split(/\r?\n/).filter(Boolean).slice(-6).join('\n')
-    const npmMissing = /npm: (command )?not found|command not found/i.test(install.stdout)
+  if (install?.code !== 0 || install.error) {
+    const output = install?.output ?? `${install?.stdout ?? ''}\n${install?.stderr ?? ''}`
+    const npmMissing = /npm: (command )?not found|command not found/i.test(output)
     const hint = npmMissing
       ? '远端没有可用的 npm/Node.js：请先在远端安装 Node.js（含 npm），再重新连接。'
-      : '请先在远端手动安装 dsh（npm install -g @deepseek-ai/dsh），再重新连接。'
+      : '请检查 SSH 错误和远端安装输出，或先在远端手动安装 dsh（npm install -g @deepseek-ai/dsh）。'
     failConnection(
       conn,
-      `远端没有 dsh，自动安装失败。${hint}${tail ? `\n最近输出：\n${tail}` : ''}`,
+      `远端 dsh 自动安装命令未成功完成。${hint}\n${remoteStepFailureDetail(install)}`,
       '[setup] 自动安装失败',
     )
     return false
   }
 
-  const recheck = await runRemoteStep(
+  const recheck = await runStep(
     conn,
     sshPath,
     buildRemoteCommandArgs(conn.host, REMOTE_DSH_CHECK_COMMAND),
     SETUP_PROBE_TIMEOUT_MS,
   )
   if (conn.status !== 'connecting') return false
-  if (recheck.code !== 0 || !recheck.stdout.includes('DSH_OK')) {
+  const recheckState = parseRemoteDshCheck(recheck)
+  if (recheckState === 'failed') {
     failConnection(
       conn,
-      '自动安装命令执行完成，但仍找不到 dsh 命令；请在设置里检查「自动安装命令」，或先在远端手动安装。',
+      `自动安装命令执行完成，但安装后 SSH 复查失败，无法确认 dsh 是否可用。\n${remoteStepFailureDetail(recheck)}`,
+      '[setup] 安装后 SSH 复查失败',
+    )
+    return false
+  }
+  if (recheckState === 'missing') {
+    failConnection(
+      conn,
+      '自动安装命令执行完成，但远端仍找不到 dsh 命令；请检查非交互 SSH 会话的 PATH，或先在远端手动安装。',
       '[setup] 安装后仍未找到 dsh',
     )
     return false
@@ -1530,7 +1598,7 @@ function disconnectAllConnections() {
 }
 
 /* ========================================================================== *
- * SSH 测试（POST /test，同步跑一次 ssh echo，12 秒超时）
+ * SSH 测试（POST /test，同步跑一次 ssh echo，60 秒总超时）
  * ========================================================================== */
 
 function runSshTest(host) {
@@ -1540,7 +1608,7 @@ function runSshTest(host) {
   })
 }
 
-function executeSshTest(sshPath, host) {
+function executeSshTest(sshPath, host, spawnProcess = spawn) {
   const args = buildTestArgs(host)
   return new Promise((resolvePromise) => {
     let settled = false
@@ -1570,7 +1638,7 @@ function executeSshTest(sshPath, host) {
     }
 
     try {
-      child = spawn(sshPath, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+      child = spawnProcess(sshPath, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
     } catch (error) {
       finish({ ok: false, error: `无法启动 ssh 进程：${toMessage(error)}` })
       return
@@ -1581,7 +1649,7 @@ function executeSshTest(sshPath, host) {
     child.stdout?.on('data', collect)
     child.stderr?.on('data', collect)
     child.on('error', (error) => finish({ ok: false, error: `无法启动 ssh 进程：${toMessage(error)}` }))
-    child.on('exit', (code, signal) => {
+    child.on('close', (code, signal) => {
       const text = sanitizeOutputText(output).trim()
       const detail = truncated ? `${text}\n…（输出已截断）` : text
       if (code === 0) {
@@ -1591,7 +1659,10 @@ function executeSshTest(sshPath, host) {
       finish({ ok: false, error: detail || `SSH 测试失败（${formatExit(code, signal)}）` })
     })
 
-    timer = setTimeout(() => finish({ ok: false, error: 'SSH 测试超时（12 秒）' }), TEST_TIMEOUT_MS)
+    timer = setTimeout(
+      () => finish({ ok: false, error: `SSH 测试超时（${Math.round(TEST_TIMEOUT_MS / 1000)} 秒）` }),
+      TEST_TIMEOUT_MS,
+    )
   })
 }
 
@@ -2446,10 +2517,19 @@ async function handleRequest(ctx, req, res) {
 }
 
 /* ========================================================================== *
- * 协议/脚本纯函数（导出供测试单独校验，不改变插件运行时行为）
+ * 协议/脚本与离线测试入口（默认依赖保持不变，测试可注入假步骤/子进程）
  * ========================================================================== */
 
-export { buildRemoteDetachedLaunchScript, buildRemoteStopScript, buildSshArgs }
+export {
+  buildRemoteDetachedLaunchScript,
+  buildRemoteStopScript,
+  buildSshArgs,
+  ensureRemoteDsh,
+  executeSshTest,
+  parseRemoteDshCheck,
+  prepareDetachedRemoteDsh,
+  runRemoteStep,
+}
 
 /* ========================================================================== *
  * 插件入口
