@@ -33,12 +33,12 @@ Requirements: DSH Desktop, an OpenSSH client with non-interactive key auth
 (`BatchMode=yes`; use ssh-agent for passphrase keys), and Node.js + `dsh` on the server
 (auto-installed on first connect if missing).
 
-Install (see [安装](#安装) for all three ways):
+Install (the repo is public; see [安装](#安装) for every way):
 
-1. `git clone https://github.com/marapapman/dsh-smartremote.git`
-2. In DSH: sidebar **Plugins** → **Add plugin** → paste the absolute path of the clone
-   (or run `dsh plugin add /path/to/dsh-smartremote` from a terminal).
-3. Open **Settings → Remote Hosts**, add a server, then click its sidebar icon.
+1. In DSH: sidebar **Plugins** → **Add plugin** → paste
+   `git+https://github.com/marapapman/dsh-smartremote.git` and confirm. No clone needed;
+   if GitHub is slow on your network, just retry — the second attempt usually succeeds.
+2. Open **Settings → Remote Hosts**, add a server, then click its sidebar icon.
 
 </details>
 
@@ -66,7 +66,7 @@ Install (see [安装](#安装) for all three ways):
 ## 安装
 
 本仓库就是一个完整的 DSH bundle（Host 插件 + Client 面板，含 `dsh.bundle.patch`），
-不需要发布到 npm。先克隆到本机任意目录：
+**可以直接从 Git 地址安装**，不需要先发布到 npm。也可以先克隆到本机任意目录：
 
 ```sh
 git clone https://github.com/marapapman/dsh-smartremote.git
@@ -75,24 +75,26 @@ git clone https://github.com/marapapman/dsh-smartremote.git
 > 桌面版、Web 版都内置了「插件」页和 `dsh plugin` 命令；装完通常立即生效，
 > 如果界面提示「请重启 DSH 使更改生效」，按提示重启即可。
 
-### 方式一：应用内安装（推荐，不用改配置文件）
+### 方式一：应用内安装（推荐，不用改配置文件、也不用克隆）
 
 1. 打开 DSH 应用，在左侧栏点 **插件**；
 2. 点 **添加插件**（主按钮），或点它右侧箭头 → **安装第三方插件**；
    ——「添加插件」对话框的说明是「输入插件的包名、GitHub 仓库地址或本地目录路径」，
    支持 npm 包、Git 仓库、压缩包和**本地目录**；
 3. 在 **包名或地址** 输入框里填下面任意一种，然后点 **安装**：
-   - 本地目录绝对路径（推荐，仓库已克隆到本机）：
+   - **Git 地址（推荐，无需克隆）**：`git+https://github.com/marapapman/dsh-smartremote.git`
+     （仓库是公开的，可直接匿名拉取；大陆网络访问 GitHub 偶尔 5 秒超时，
+     直接再点一次「安装」重试即可，实测第二次约 6 秒完成）
+   - 本地目录绝对路径（已克隆到本机时用）：
      - Windows：`C:\Users\me\src\dsh-smartremote`
      - macOS / Linux：`/Users/me/src/dsh-smartremote`
-   - Git 地址：`git+https://github.com/marapapman/dsh-smartremote.git`
-   - （若仓库不可匿名访问，请用本地目录方式，或换成你能访问的地址）
 4. 等待安装任务跑完（对话框里能看到 pnpm 输出）；成功后该插件出现在
    **已安装插件** 列表里，并已加入 profile 的 `dsh.profile.bundles`。
 5. 到 **设置 → 远程主机** 添加第一台服务器，保存后左侧栏出现以主机名命名的图标。
 
-升级与卸载都在同一页面：插件详情里点 **卸载**；本插件不是 npm 包，
-升级方式是「卸载后重新安装」（或直接 `git pull` 后重装）。
+升级与卸载都在同一页面：插件详情里点 **卸载**；更新时卸载后重新添加同一地址即可
+（会从仓库拉取最新 commit）。本插件没有发布到 npm registry，所以**不能**用
+`dsh plugin add dsh-smartremote` 这种纯包名安装。
 
 ### 方式二：命令行
 
