@@ -116,12 +116,15 @@ stdout 中有唯一、完整的 `DSH_OK` / `DSH_MISSING` 状态行时，才判�
        -L 127.0.0.1:<localPort>:127.0.0.1:<remotePort> -N <user>@<host>
    ```
    永远带 `-N`：远端 dsh 不挂在 ssh 会话下，断开只影响隧道。
-4. 合并 stdout+stderr 进 ring buffer（脱敏：`token=` 值打码；token 本身来自探测脚本，
-   不再从 ssh 输出里解析）。
-5. 用 `node:http` 请求 `http://127.0.0.1:<localPort>/`（3s 超时，忽略 401/302），
-   有响应即 `connected`，`url = http://127.0.0.1:<localPort>/?token=<token>`。
-6. 45s 没就绪 → `error`，附最后 20 行日志；进程退出时：未就绪 → `error`，已就绪 →
-   `disconnected` 并进入自动重连退避。
+4. 合并 stdout+stderr 进 ring buffer（脱敏：URL 里的 `token=` 值与协议整行 `TOKEN=` 都
+   打码；token 本身来自探测脚本的原始 stdout，不再从 ssh 输出里解析）。
+5. 用 `node:http` 请求 `http://127.0.0.1:<localPort>/`（单次 20s wall-clock 限时，忽略
+   401/302），有响应即 `connected`，`url = http://127.0.0.1:<localPort>/?token=<token>`。
+   不用 socket idle 超时：慢链路上转发通道可能十几秒才回第一个响应，按 idle 切断会把
+   一次正常往返打断，表现为「隧道已建但一直不就绪」。未就绪时每 750ms 重试一次，每次
+   探测绑定当时的 attempt 与本地端口，迟到的响应/错误不影响新的连接尝试。
+6. 45s 没就绪 → `error`，附最后一次探活原因与最后 20 行日志；该时限只计隧道 spawn 之后
+   的阶段。进程退出时：未就绪 → `error`，已就绪 → `disconnected` 并进入自动重连退避。
 7. 断开：`child.kill()`，2 秒后仍活着则 win32 `taskkill /pid <pid> /T /F`；
    **不清理远端进程**。插件卸载（`ctx.effect` 清理）时同样只断开本地隧道。
 8. 每次连接都先执行「自动探测 + 常驻启动」（`prepareDetachedRemoteDsh`）：
@@ -752,3 +755,23 @@ Client 半：
   覆盖三态、exit255、stderr 假标记、null/超时/未知/歧义输出、原始错误脱敏、安装后复查、
   未知状态不清理，以及 21.6s 成功/60s 边界。另用本机 node 子进程验证分流、close、
   进程失败与超时，未新增 npm 依赖。
+
+### v0.11.2 — 慢链路就绪探测与 TOKEN 日志脱敏
+
+- **就绪探测改为 wall-clock 限时**：单次探测上限 20s，不再用 3s 的 socket idle 超时。
+  实机测到 SSH 隧道建立后转发端口上的首个 HTTP 响应约需 7.4s，旧实现每次都在第 3 秒
+  打断一次正常往返，45s 内始终凑不出一次完整响应，最终误报「未能建立端口转发或服务
+  未就绪」。45s 阶段预算不变，且只从隧道 spawn 之后开始计。
+- **探测请求有明确生命周期**：在飞请求记在连接记录上，断开/失败/就绪/取消时统一销毁；
+  旧的重试与期限定时器一并清理，避免连接重试后仍有旧请求或旧定时器在跑。
+- **旧尝试隔离**：每次探测绑定当时的 attempt 与本地端口，迟到的响应既不会把新尝试标记
+  为就绪，也不会替新尝试排队重试；隧道 ssh 子进程的 `error`/`exit` 回调同样加了
+  attempt 与进程身份守卫，旧隧道退出不会影响新连接。
+- **诊断更准确**：超时文案区分「还没拿到令牌」与「隧道已建但没收到 HTTP 响应」，并附
+  最后一次探活失败原因；不再暗示前面的探测步骤吃掉了这 45 秒。
+- **日志脱敏**：协议整行 `TOKEN=<值>` 在连接日志与 `remote-desktop-ssh.log` 镜像里统一
+  写成 `TOKEN=***`（分块到达的行也会在拼成完整行后再脱敏）。解析用的原始 stdout 与
+  `conn.token` 不受影响，端口转发与远端任务照常。
+- `test/ssh-regression.mjs` 增加：>3s 才到的响仍判就绪、20s wall-clock 期限与 750ms 重试、
+  取消/断开清理请求、旧 attempt 的响应与错误不污染新尝试、拒绝连接的诊断保留、
+  超时文案两种分支、`TOKEN=` 行在日志/镜像中脱敏而原始 stdout 保留（含跨 chunk 用例）。

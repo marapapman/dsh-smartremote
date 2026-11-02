@@ -6,16 +6,20 @@
  */
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { after, test } from 'node:test'
 import {
+  buildConnectTimeoutMessage,
+  cancelProbe,
   ensureRemoteDsh,
   executeSshTest,
   parseRemoteDshCheck,
   prepareDetachedRemoteDsh,
+  probeRemoteOnce,
+  probeTiming,
   runRemoteStep,
 } from '../index.js'
 
@@ -37,8 +41,27 @@ function connection() {
     host: { host: 'offline.invalid', port: 22, user: 'offline', identityFile: '', remotePort: 39080 },
     status: 'connecting', error: null, url: null, token: null,
     log: [], lineBuffer: '', child: null, children: new Set(),
-    deadlineTimer: null, probeTimer: null, reconnectTimer: null,
+    deadlineTimer: null, probeTimer: null, probeActive: null, probeLastError: null,
+    reconnectTimer: null, attempt: 1,
   }
+}
+
+/** 已拿到令牌、只等本地转发端口就绪的连接记录。 */
+function probeConnection(overrides = {}) {
+  return Object.assign(connection(), { localPort: 5000, token: 'fake-token' }, overrides)
+}
+
+/** 假的 httpGet：记录调用，并把 request 句柄交给测试驱动。 */
+function fakeHttp() {
+  const calls = []
+  const impl = (options, callback) => {
+    const request = new EventEmitter()
+    request.destroyed = false
+    request.destroy = () => { request.destroyed = true }
+    calls.push({ options, callback, request })
+    return request
+  }
+  return { calls, impl }
 }
 
 function step(code, stdout = '', stderr = '', error = null) {
@@ -207,7 +230,17 @@ for (const [label, result] of [
     assert.equal(runner.calls.length, 1)
     assert.equal(cleaned.length, 0)
     assert.doesNotMatch(conn.error, /在后台启动后没有输出访问令牌/)
-    if (result?.stderr) assert.ok(conn.error.includes(result.stderr.trim()))
+    if (result?.stderr) {
+      // 日志与错误文案会保留 stderr，但协议里的 TOKEN= 行必须打码。
+      for (const line of result.stderr.trim().split(/\r?\n/)) {
+        if (/^[ \t]*TOKEN=/.test(line)) {
+          assert.ok(conn.error.includes('TOKEN=***'), 'token lines must be redacted in diagnostics')
+          assert.ok(!conn.error.includes(line), 'raw token line must never reach diagnostics')
+        } else {
+          assert.ok(conn.error.includes(line), `diagnostics must keep stderr line: ${line}`)
+        }
+      }
+    }
   })
 }
 
@@ -345,4 +378,180 @@ test('SSH test preserves actual authentication errors before the 60-second deadl
   assert.deepEqual(await resultPromise, { ok: false, error: 'Permission denied (publickey).' })
   t.mock.timers.tick(60_000)
   assert.equal(child.killCount, 0)
+})
+
+/* ------------------------------------------------------------------------- *
+ * 就绪探测：慢链路不被打断、wall-clock 限时、旧尝试隔离、诊断与脱敏
+ * ------------------------------------------------------------------------- */
+
+test('probe timing allows a round trip far slower than the old 3-second socket idle limit', () => {
+  assert.ok(probeTiming.timeoutMs >= 15_000, 'probe must tolerate several seconds of link latency')
+  assert.equal(probeTiming.intervalMs, 750)
+})
+
+test('readiness probe accepts a response slower than the old 3-second limit', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const conn = probeConnection()
+  const http = fakeHttp()
+  probeRemoteOnce(conn, http.impl)
+  assert.equal(http.calls.length, 1)
+  assert.equal(http.calls[0].options.port, 5000)
+
+  // 实测一次完整往返约 7.4 秒：旧实现会在第 3 秒把它打断。
+  t.mock.timers.tick(4_000)
+  assert.equal(http.calls[0].request.destroyed, false, 'slow but healthy round trip must not be aborted')
+  assert.equal(conn.status, 'connecting')
+
+  http.calls[0].callback({ resume() {} })
+  assert.equal(conn.status, 'connected')
+  assert.match(conn.url, /token=fake-token/)
+  assert.equal(conn.probeActive, null)
+})
+
+test('readiness probe is bounded by a wall-clock deadline, then retries once', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const conn = probeConnection()
+  const http = fakeHttp()
+  probeRemoteOnce(conn, http.impl)
+
+  t.mock.timers.tick(probeTiming.timeoutMs - 1)
+  assert.equal(http.calls[0].request.destroyed, false)
+  t.mock.timers.tick(1)
+  assert.equal(http.calls[0].request.destroyed, true, 'deadline must release the request')
+  assert.match(conn.probeLastError, /单次探活未在 20 秒内收到远端 HTTP 响应/)
+  assert.equal(conn.status, 'connecting')
+  assert.equal(http.calls.length, 1)
+
+  t.mock.timers.tick(probeTiming.intervalMs)
+  assert.equal(http.calls.length, 2, 'a failed probe schedules exactly one retry')
+})
+
+test('cancelling an in-flight probe releases its request and stops retrying', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const conn = probeConnection()
+  const http = fakeHttp()
+  probeRemoteOnce(conn, http.impl)
+  assert.equal(conn.probeActive.request, http.calls[0].request)
+
+  cancelProbe(conn)
+  assert.equal(http.calls[0].request.destroyed, true)
+  assert.equal(conn.probeActive, null)
+  assert.equal(conn.probeTimer, null)
+
+  t.mock.timers.tick(probeTiming.timeoutMs + probeTiming.intervalMs)
+  assert.equal(http.calls.length, 1, 'a cancelled probe must never retry')
+})
+
+test('cancelling clears a queued retry timer', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const conn = probeConnection()
+  const http = fakeHttp()
+  probeRemoteOnce(conn, http.impl)
+  t.mock.timers.tick(probeTiming.timeoutMs)
+  assert.notEqual(conn.probeTimer, null, 'a retry should be queued after the deadline')
+
+  cancelProbe(conn)
+  assert.equal(conn.probeTimer, null)
+  t.mock.timers.tick(probeTiming.intervalMs)
+  assert.equal(http.calls.length, 1)
+})
+
+test('a late response from an older attempt cannot mark the new connection ready', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const conn = probeConnection()
+  const http = fakeHttp()
+  probeRemoteOnce(conn, http.impl)
+
+  // 自动重连换了 attempt 与本地端口，旧探测的响应这时才回来。
+  conn.attempt = 2
+  conn.localPort = 5001
+  http.calls[0].callback({ resume() {} })
+
+  assert.equal(conn.status, 'connecting')
+  assert.equal(conn.url, null)
+})
+
+test('an error from an older attempt does not queue a retry on the new attempt', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const conn = probeConnection()
+  const http = fakeHttp()
+  probeRemoteOnce(conn, http.impl)
+
+  conn.attempt = 2
+  conn.localPort = 5001
+  http.calls[0].request.emit('error', new Error('connect ECONNREFUSED 127.0.0.1:5000'))
+
+  assert.equal(conn.probeTimer, null)
+  t.mock.timers.tick(probeTiming.intervalMs)
+  assert.equal(http.calls.length, 1)
+})
+
+test('a refused probe records the reason and keeps retrying while connecting', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const conn = probeConnection()
+  const http = fakeHttp()
+  probeRemoteOnce(conn, http.impl)
+
+  http.calls[0].request.emit('error', new Error('connect ECONNREFUSED 127.0.0.1:5000'))
+  assert.match(conn.probeLastError, /ECONNREFUSED/)
+  assert.equal(conn.status, 'connecting')
+
+  t.mock.timers.tick(probeTiming.intervalMs)
+  assert.equal(http.calls.length, 2)
+})
+
+test('connect timeout describes the tunnel stage instead of blaming the token', () => {
+  const conn = probeConnection({
+    probeLastError: '本地探活请求失败：connect ECONNREFUSED 127.0.0.1:5000',
+    log: ['[connect] 第 1 次连接尝试（initial）', '[setup] 检测到远端已在运行的 dsh（端口 39080），直接接入'],
+  })
+  const message = buildConnectTimeoutMessage(conn)
+  assert.match(message, /SSH 连接超时（45 秒）/)
+  assert.match(message, /SSH 隧道已启动/)
+  assert.doesNotMatch(message, /没有拿到远端 dsh 的访问令牌/)
+  assert.match(message, /最近一次探活失败/)
+  assert.match(message, /ECONNREFUSED/)
+  assert.match(message, /最近日志/)
+})
+
+test('connect timeout still reports a missing token when there is none', () => {
+  const conn = probeConnection({ token: null })
+  assert.match(buildConnectTimeoutMessage(conn), /没有拿到远端 dsh 的访问令牌/)
+})
+
+test('protocol TOKEN lines are redacted from diagnostics while raw stdout keeps them', async () => {
+  const conn = connection()
+  const result = await runRemoteStep(
+    conn,
+    process.execPath,
+    ['-e', "process.stdout.write('REUSE=1\\nTOKEN=secret-value\\n')"],
+    5_000,
+  )
+  assert.equal(result.code, 0)
+  // 解析用的原始输出必须完整保留，才能取到 conn.token。
+  assert.match(result.stdout, /TOKEN=secret-value/)
+  const logged = conn.log.join('\n')
+  assert.match(logged, /TOKEN=\*\*\*/)
+  assert.ok(!logged.includes('secret-value'), 'token must never reach the connection log')
+})
+
+test('TOKEN lines split across chunks are still redacted', async () => {
+  const conn = connection()
+  const script = "process.stdout.write('TOKE'); setTimeout(() => process.stdout.write('N=split-secret\\n'), 60)"
+  const result = await runRemoteStep(conn, process.execPath, ['-e', script], 5_000)
+  assert.equal(result.code, 0)
+  assert.ok(result.stdout.includes('TOKEN=split-secret'))
+  const logged = conn.log.join('\n')
+  assert.match(logged, /TOKEN=\*\*\*/)
+  assert.ok(!logged.includes('split-secret'))
+})
+
+test('the SSH mirror log file also stores redacted TOKEN lines', async () => {
+  const conn = connection()
+  await runRemoteStep(conn, process.execPath, ['-e', "process.stdout.write('TOKEN=mirror-secret\\n')"], 5_000)
+  // 镜像写入按 400ms 合并落盘。
+  await new Promise((resolve) => setTimeout(resolve, 700))
+  const mirror = await readFile(join(home, 'remote-desktop-ssh.log'), 'utf8')
+  assert.match(mirror, /TOKEN=\*\*\*/)
+  assert.ok(!mirror.includes('mirror-secret'), 'token must never reach the SSH mirror log')
 })

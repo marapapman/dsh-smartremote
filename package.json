@@ -1,6 +1,6 @@
 {
   "name": "dsh-smartremote",
-  "version": "0.11.1",
+  "version": "0.11.2",
   "description": "DSH Desktop plugin: operate a dsh instance running on a remote server over SSH, with a toolbar-less takeover view in the desktop app.",
   "type": "module",
   "license": "MIT",

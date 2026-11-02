@@ -38,7 +38,10 @@ const MAX_TEST_OUTPUT = 16 * 1024
 const CONNECT_TIMEOUT_MS = 45_000
 const INSTALL_TIMEOUT_MS = 600_000
 const SETUP_PROBE_TIMEOUT_MS = 25_000
-const PROBE_TIMEOUT_MS = 3_000
+// 单次就绪探测的 wall-clock 上限。SSH 隧道上的转发通道在慢链路上可能要十几秒才
+// 回第一个响应；旧的 3 秒只覆盖「socket 无数据」的间隔，会反复打断一次正常往返，
+// 表现为「隧道已建但 45 秒内始终未就绪」。
+const PROBE_TIMEOUT_MS = 20_000
 const PROBE_INTERVAL_MS = 750
 const TEST_TIMEOUT_MS = 60_000
 const KILL_GRACE_MS = 2_000
@@ -71,6 +74,9 @@ const SSH_TEST_OPTIONS = [
 
 const TOKEN_REDACT_PATTERN = /([?&]token=)[A-Za-z0-9._~-]+/g
 const ANSI_ESCAPE_PATTERN = /\u001b\[[0-9;]*[A-Za-z]/g
+// 准备脚本协议用整行 `TOKEN=<值>` 回传访问令牌；这些行会进连接日志与 SSH 镜像文件，
+// 因此按整行打码（只影响日志文本，解析用的原始 stdout 与 conn.token 不受影响）。
+const TOKEN_LINE_REDACT_PATTERN = /^([ \t]*TOKEN=).*$/gm
 
 /* 本地 SSH 自动发现（GET /discover）相关常量。 */
 const DISCOVER_CACHE_MS = 5_000
@@ -204,6 +210,7 @@ function formatCommand(file, args) {
 function sanitizeOutputText(value) {
   return String(value ?? '')
     .replace(ANSI_ESCAPE_PATTERN, '')
+    .replace(TOKEN_LINE_REDACT_PATTERN, '$1***')
     .replace(TOKEN_REDACT_PATTERN, '$1***')
 }
 
@@ -1201,6 +1208,9 @@ function createConnection(host) {
     children: new Set(),
     deadlineTimer: null,
     probeTimer: null,
+    // 当前在飞的就绪探测（含它的 wall-clock 期限与请求句柄）与最近一次失败原因。
+    probeActive: null,
+    probeLastError: null,
     // 意外断链自动重连（仅保持远端运行）：已重试次数与定时器。
     reconnectAttempt: 0,
     reconnectTimer: null,
@@ -1230,10 +1240,7 @@ function clearConnectionTimers(conn) {
     clearTimeout(conn.deadlineTimer)
     conn.deadlineTimer = null
   }
-  if (conn.probeTimer !== null) {
-    clearTimeout(conn.probeTimer)
-    conn.probeTimer = null
-  }
+  cancelProbe(conn)
   if (conn.reconnectTimer !== null && conn.reconnectTimer !== undefined) {
     clearTimeout(conn.reconnectTimer)
     conn.reconnectTimer = null
@@ -1313,15 +1320,23 @@ function failConnection(conn, message, logMessage = null) {
   appendLogLine(conn, logMessage ?? `[error] ${message}`)
 }
 
-/** 45 秒超时的错误文案：按 SPEC 附上最后 20 行日志。 */
+/**
+ * 连接超时的错误文案。该时限只覆盖「隧道 spawn 之后」这一段，不包含前面的
+ * 探测/准备步骤，所以文案不能让人误以为前面的步骤把它用掉了。
+ */
 function buildConnectTimeoutMessage(conn) {
+  const seconds = Math.round(CONNECT_TIMEOUT_MS / 1000)
   const headline =
     conn.token === null
-      ? 'SSH 连接超时（45 秒）：没有拿到远端 dsh 的访问令牌（远端可能仍在启动）。请查看远端日志 ~/.dsh/remote-desktop-web.log。'
-      : 'SSH 连接超时（45 秒）：未能建立到远端 dsh 的端口转发或服务未就绪。'
+      ? `SSH 连接超时（${seconds} 秒）：没有拿到远端 dsh 的访问令牌（远端可能仍在启动）。请查看远端日志 ~/.dsh/remote-desktop-web.log。`
+      : `SSH 连接超时（${seconds} 秒）：SSH 隧道已启动，但在该时限内始终没有收到远端 dsh 的 HTTP 响应（链路较慢或远端服务未就绪）。`
+  const probeError =
+    typeof conn.probeLastError === 'string' && conn.probeLastError
+      ? `\n最近一次探活失败：${conn.probeLastError}`
+      : ''
   const tail = conn.log.slice(-20)
-  if (tail.length === 0) return headline
-  return `${headline}\n最近日志：\n${tail.join('\n')}`
+  const detail = tail.length === 0 ? '' : `\n最近日志：\n${tail.join('\n')}`
+  return `${headline}${probeError}${detail}`
 }
 
 /** 启动后按 SPEC 参数拉起 ssh，并挂上输出/退出/超时处理。 */
@@ -1401,18 +1416,28 @@ async function beginSshConnection(conn, options = {}) {
     child.stdout?.on('data', (chunk) => handleSshOutput(conn, chunk))
     child.stderr?.on('data', (chunk) => handleSshOutput(conn, chunk))
     child.on('error', (error) => {
-      if (conn.child === child) conn.child = null
+      // 旧尝试的进程回调不能影响后来的连接尝试。
+      if (superseded() || conn.child !== child) return
+      conn.child = null
       failConnection(conn, `无法启动 ssh 进程：${toMessage(error)}`)
     })
     child.on('exit', (code, signal) => {
-      if (conn.child === child) conn.child = null
+      const isCurrentChild = conn.child === child
+      if (isCurrentChild) conn.child = null
+      // 被新尝试取代或被 terminateChild 主动结束的旧隧道：静默忽略。
+      if (superseded() || !isCurrentChild) return
       handleSshExit(conn, code, signal)
     })
 
     conn.deadlineTimer = setTimeout(() => {
       conn.deadlineTimer = null
       if (conn.status !== 'connecting') return
-      failConnection(conn, buildConnectTimeoutMessage(conn), 'SSH 连接超时（45 秒）')
+      // 该时限只计隧道 spawn 之后的阶段，与前面的探测/准备步骤无关。
+      failConnection(
+        conn,
+        buildConnectTimeoutMessage(conn),
+        `SSH 连接超时（${Math.round(CONNECT_TIMEOUT_MS / 1000)} 秒）`,
+      )
     }, CONNECT_TIMEOUT_MS)
     if (typeof conn.deadlineTimer.unref === 'function') conn.deadlineTimer.unref()
 
@@ -1494,6 +1519,7 @@ function retryConnection(conn) {
   conn.error = null
   conn.url = null
   conn.token = null
+  conn.probeLastError = null
   startAttempt(conn, { preferredLocalPort: preferred, skipDshCheck: true, reason: 'auto-reconnect' })
 }
 
@@ -1503,46 +1529,113 @@ function beginProbe(conn) {
   probeRemoteOnce(conn)
 }
 
-/** 用 node:http 请求本机转发端口；有任意响应（含 401/302）即视为已就绪。 */
-function probeRemoteOnce(conn) {
+/** 取消在飞的就绪探测：重试定时器、wall-clock 期限与活动请求一并结束。 */
+function cancelProbe(conn) {
+  if (conn.probeTimer !== null) {
+    clearTimeout(conn.probeTimer)
+    conn.probeTimer = null
+  }
+  const probe = conn.probeActive ?? null
+  conn.probeActive = null
+  if (probe === null) return
+  // 置位后即使有迟到的 response/error 回调也不会再重试或标记就绪。
+  probe.settled = true
+  if (probe.deadline !== null) {
+    clearTimeout(probe.deadline)
+    probe.deadline = null
+  }
+  const request = probe.request
+  probe.request = null
+  if (request) {
+    try {
+      request.destroy()
+    } catch {
+      // 请求可能已经结束。
+    }
+  }
+}
+
+/**
+ * 用 node:http 请求本机转发端口；有任意响应（含 401/302）即视为已就绪。
+ *
+ * 单次探测按 wall-clock 限时：SSH 转发通道在慢链路上可能十几秒才回第一个响应，
+ * 因此不再依赖 socket idle 超时（那会在一次正常往返的中途中断请求），而是自己
+ * 计时到 PROBE_TIMEOUT_MS 才放弃并重试。每次探测绑定当时的 attempt 与本地端口，
+ * 迟到的响应/错误既不会标记新连接就绪，也不会污染新连接的重试。
+ */
+function probeRemoteOnce(conn, httpRequest = httpGet) {
   if (conn.status !== 'connecting' || typeof conn.localPort !== 'number') return
-  let settled = false
-  const onFailure = () => {
-    if (settled) return
-    settled = true
-    if (conn.status !== 'connecting') return
+  const attempt = conn.attempt
+  const localPort = conn.localPort
+  const isCurrent = () =>
+    conn.status === 'connecting' && conn.attempt === attempt && conn.localPort === localPort
+  const probe = { attempt, localPort, request: null, deadline: null, settled: false }
+  conn.probeActive = probe
+
+  /** 收尾本次探测；只有仍是当前 attempt/端口时才安排下一次重试。 */
+  const settle = (error) => {
+    if (probe.settled) return
+    probe.settled = true
+    if (probe.deadline !== null) {
+      clearTimeout(probe.deadline)
+      probe.deadline = null
+    }
+    if (conn.probeActive === probe) conn.probeActive = null
+    if (error) conn.probeLastError = error
+    if (!isCurrent()) return
     conn.probeTimer = setTimeout(() => {
       conn.probeTimer = null
-      probeRemoteOnce(conn)
+      probeRemoteOnce(conn, httpRequest)
     }, PROBE_INTERVAL_MS)
     if (typeof conn.probeTimer.unref === 'function') conn.probeTimer.unref()
   }
 
+  const ready = () => {
+    if (probe.settled) return
+    probe.settled = true
+    if (probe.deadline !== null) {
+      clearTimeout(probe.deadline)
+      probe.deadline = null
+    }
+    if (conn.probeActive === probe) conn.probeActive = null
+    if (!isCurrent()) return
+    conn.probeLastError = null
+    markConnected(conn)
+  }
+
   let request
   try {
-    request = httpGet(
+    request = httpRequest(
       {
         host: '127.0.0.1',
-        port: conn.localPort,
+        port: localPort,
         path: '/',
-        timeout: PROBE_TIMEOUT_MS,
         agent: false,
         headers: { 'user-agent': 'dsh-remote-desktop/0.1' },
       },
       (response) => {
         // 忽略状态码（401/302 也说明远端服务已就绪），读取并丢弃响应体。
         response.resume()
-        if (settled) return
-        settled = true
-        markConnected(conn)
+        ready()
       },
     )
-  } catch {
-    onFailure()
+  } catch (error) {
+    settle(`无法发起本地探活请求：${toMessage(error)}`)
     return
   }
-  request.on('timeout', () => request.destroy(new Error('probe timeout')))
-  request.on('error', onFailure)
+
+  probe.request = request
+  request.on('error', (error) => settle(`本地探活请求失败：${toMessage(error)}`))
+  probe.deadline = setTimeout(() => {
+    probe.deadline = null
+    try {
+      request.destroy()
+    } catch {
+      // 请求可能已经结束。
+    }
+    settle(`单次探活未在 ${Math.round(PROBE_TIMEOUT_MS / 1000)} 秒内收到远端 HTTP 响应`)
+  }, PROBE_TIMEOUT_MS)
+  if (typeof probe.deadline.unref === 'function') probe.deadline.unref()
 }
 
 /** 发起连接（立即返回，后台推进状态，Client 轮询 /state）。 */
@@ -2521,15 +2614,21 @@ async function handleRequest(ctx, req, res) {
  * ========================================================================== */
 
 export {
+  buildConnectTimeoutMessage,
   buildRemoteDetachedLaunchScript,
   buildRemoteStopScript,
   buildSshArgs,
+  cancelProbe,
   ensureRemoteDsh,
   executeSshTest,
   parseRemoteDshCheck,
   prepareDetachedRemoteDsh,
+  probeRemoteOnce,
   runRemoteStep,
 }
+
+/** 就绪探测的 wall-clock 时限与重试间隔（离线测试断言用）。 */
+export const probeTiming = { timeoutMs: PROBE_TIMEOUT_MS, intervalMs: PROBE_INTERVAL_MS }
 
 /* ========================================================================== *
  * 插件入口
