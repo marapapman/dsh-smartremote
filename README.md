@@ -6,7 +6,7 @@ SSH 连接、用远端 dsh 界面**接管中央区域**（无地址栏），并�
 回到本地桌面界面；不需要来回切终端，也不需要单独开浏览器。
 
 - 仓库：<https://github.com/marapapman/dsh-smartremote>
-- 版本：`0.9.11`（见 [SPEC.md](SPEC.md) 修订记录）
+- 版本：`0.11.1`（见 [SPEC.md](SPEC.md) 修订记录）
 
 <details>
 <summary><b>English overview</b></summary>
@@ -281,6 +281,9 @@ node test/detached-smoke.mjs
 # Client 半冒烟测试（模块加载、槽位注册、中英文字典键对齐）
 node test/client-smoke.mjs
 
+# SSH 离线回归（探测三态、原始错误、安装后复查、60 秒测试边界；不联网/不读私钥）
+node --test test/ssh-regression.mjs
+
 # 语法检查（两个半；index.js 是 ESM）
 node --check client.js
 cp index.js /tmp/index.mjs && node --check /tmp/index.mjs
@@ -320,6 +323,12 @@ SSH 隧道与远端界面需要真实服务器联调：添加一台能免密 SSH
   `GET /auth-api/v0/users/current` 返回 403，属于平台侧权限问题，不影响对话
   （`https://api.deepseek.com/models` 正常；日志里会反复出现
   `[deepseek-account] request failed … status: 403`）。
+- **SSH 测试超时**：v0.11.1 起「测试」的总超时为 60 秒，避免握手/认证较慢但可成功的连接
+  被旧的 12 秒限制提前终止。OpenSSH 自身的握手连接超时仍由 `ConnectTimeout=8` 控制；
+  超时不代表远端缺少 dsh，也不会据此自动安装。
+- **探测失败不是未安装**：只有 SSH 命令成功退出、stdout 明确返回 `DSH_MISSING`，才会
+  触发自动安装。认证失败（如 `Permission denied`）、网络错误、步骤超时或未知输出都会
+  停止准备流程并保留 SSH 原始错误；安装命令成功后也必须复查成功才继续连接。
 - `Permission denied`：确认公钥已装到服务器 `~/.ssh/authorized_keys`，或私钥路径正确。
 - `command not found`：确认 `dsh` 在非交互 SSH 会话的 PATH 里（插件固定用 `dsh` 命令）。
 - 远端端口被占用（日志 `[setup] 后台启动失败（port-busy）`）：换一个「远端端口」，

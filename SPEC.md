@@ -63,7 +63,7 @@ if (admission.peer.principal.kind !== 'owner') return jsonResponse(res, 403, { o
   `<remotePort>` 上的 dsh 并等端口释放 → `{ ok:true, stopped:boolean }`（未知 id 404）
 - `POST /restart`    body `{ id }` → 结束远端端口上的 dsh 并等端口释放，再重建连接与隧道
   → `{ ok:true }`（未知 id 404）
-- `POST /test`       body `{ id }` → 同步跑一次 SSH 测试（≤15s）→ `{ ok:true, output }` 或 `{ ok:false, error }`
+- `POST /test`       body `{ id }` → 同步跑一次 SSH 测试（60s 总超时）→ `{ ok:true, output }` 或 `{ ok:false, error }`
 - `POST /client-report` body `{ report }` → 追加一行 JSON 到 `$DSH_HOME/remote-desktop-client.log`
 - `POST /open-url`    body `{ url }` → 用 Host 所在机器的默认浏览器打开该链接
   （远端登录授权页用；仅 http(s)、≤4096 字符、不含账号口令）→ `{ ok:true, opened:true, via }`
@@ -92,6 +92,17 @@ HostInput 校验：`name` ≤80（缺省用 host）；`host` 必填 ≤255；`us
 启动时读取，坏文件忽略并重命名为 `.bak`。`id` 用 `crypto.randomUUID()`。
 
 ### SSH 连接（自动探测 + 永远常驻 + 只建隧道）
+
+首次连接先探测非交互 SSH 会话的 `dsh` 命令（25s 步骤超时）。仅当 SSH **exit 0** 且
+stdout 中有唯一、完整的 `DSH_OK` / `DSH_MISSING` 状态行时，才判定命令可用 / 缺失。
+仅确切 `DSH_MISSING` 才允许自动执行安装命令；认证失败（exit 255）、网络错误、
+超时/null、进程错误、stderr 中的标记、缺失/歧义标记都必须失败并保留 SSH 诊断，不能
+当成命令缺失。安装 exit 0 后须同样复查，复查失败不等于仍未安装、更不能报安装完成。
+`DSH_MISSING` 表示该 SSH 会话的 PATH 找不到命令，不证明磁盘上从未安装过 dsh。
+
+远端步骤 stdout/stderr 独立保留、合并 output 继续写日志；等 `close` 排空输出后结算。
+准备/旧实例迁移阶段若 SSH 失败或返回未知状态，应停止且不自动清理远端进程；只有
+成功执行的准备脚本明确返回新起 `PID:<数字>` 和 `FAILED=no-token` 才可回收本次启动。
 
 1. `net.createServer()` 在 `127.0.0.1:0` 监听拿到空闲 `localPort` 后立刻 close。
 2. 找 ssh：`where ssh`（win32）/ `which ssh`，缓存结果；找不到则连接直接报错
@@ -128,7 +139,9 @@ HostInput 校验：`name` ≤80（缺省用 host）；`host` 必填 ≤255；`us
    重新建连（新连接会自动常驻启动）。
 
 SSH 测试：`ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new
--p <port> [-i <key>] <user>@<host> "echo dsh-ssh-ok"`，12s 超时，返回输出或错误。
+-p <port> [-i <key>] <user>@<host> "echo dsh-ssh-ok"`，60s 总超时，返回输出或原始错误；
+超时文案从 `TEST_TIMEOUT_MS` 动态生成。`ConnectTimeout=8` 仅控制 OpenSSH 自身的连接/握手，
+不把认证与远端命令等待强制截成 12s。
 
 注意：Windows 下 `ssh.exe` 可能要求私钥无口令（BatchMode 不弹交互）；报错信息要原样
 带给 UI，提示用户用 ssh-agent 或免密密钥。
@@ -379,8 +392,9 @@ Host 半新增字段与启动前置步骤：
 - `beginSshConnection` 在分配本地端口之前，launch 模式先执行 `ensureRemoteDsh()`：
   1. `ssh <target> "command -v dsh >/dev/null 2>&1 && echo DSH_OK || echo DSH_MISSING"`
      （超时 25s）；
-  2. 输出无 `DSH_OK` → 记录 `[setup] 开始自动安装`，执行 `installCommand`
-     （超时 600s，输出实时写入连接日志）；
+  2. 旧行为是「输出无 `DSH_OK` 就安装」；**v0.11.1 已修正**为仅 SSH exit 0 且 stdout
+     明确返回唯一完整 `DSH_MISSING` 才执行 `installCommand`（超时 600s，输出实时写入
+     连接日志）。其它错误停止并保留诊断，不得自动安装；
   3. 安装后再探测一次；仍无 `dsh` 则 `failConnection` 并给出可操作提示
      （npm 缺失 / 修改安装命令 / 手动安装）；成功则日志 `[setup] dsh 安装完成` 后
      继续原有隧道+启动流程。
@@ -723,6 +737,18 @@ Client 半：
 常驻启动、复用同 token、`ssh -N -L` 隧道 HTTP 303、`STOPPED=1/0`、端口释放且 39080
 上的 dsh 不受影响。
 
+### v0.11.1 — SSH 慢连接测试与探测失败误判修复
 
-
-
+- `POST /test` 总超时由 12s 调整为 60s，超时文案从常量动态生成。实机曾在约 22s
+  后成功认证，旧上限会提前报错；OpenSSH 的 `ConnectTimeout=8` 选项不变。
+- `runRemoteStep` 分离 stdout/stderr、保留合并诊断与超时/进程错误，使用 `close` 等待输出
+  排空。`ensureRemoteDsh` 采用 installed / missing / failed 三态：仅 exit 0 + stdout 的
+  唯一完整状态标记可信，只有明确命令缺失才能自动安装；SSH 认证/网络/超时/未知输出不
+  再伪装成未安装。安装后复查失败保留原始原因；确认仍缺命令时给出 PATH/手动安装提示。
+- 远端准备/旧实例迁移同样检查 SSH 退出状态，失败时不接受部分 token、不触发清理。
+  未知输出也不清理；只有本次新起 PID + 明确 `FAILED=no-token` 才回收。正常常驻启动
+  日志区分「未运行」与「未安装」。不改正常连接/重连/停止/重启的生命周期。
+- 新增 `test/ssh-regression.mjs`：可注入步骤/假子进程 + 虚拟时钟，不连接远端、不读私钥；
+  覆盖三态、exit255、stderr 假标记、null/超时/未知/歧义输出、原始错误脱敏、安装后复查、
+  未知状态不清理，以及 21.6s 成功/60s 边界。另用本机 node 子进程验证分流、close、
+  进程失败与超时，未新增 npm 依赖。
