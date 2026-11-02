@@ -285,6 +285,7 @@ window.__ModuleLoader__.load({
       autoConnectHint:
         '连接时自动探测远端 dsh：未运行则在后台常驻启动，已在运行则直接接入（复用同一进程，任务不中断）。',
       restartRemote: '重启远端',
+      reconnect: '重新连接',
       restarting: '重启中…',
       restartHint: '结束远端服务器上的 dsh 进程并重新启动（会中断正在执行的任务）。',
       stopRemote: '停止远端',
@@ -403,6 +404,7 @@ window.__ModuleLoader__.load({
       autoConnectHint:
         'On connect, the remote dsh is detected automatically: if it is not running it starts detached in the background; if it is already running the connection reuses the same process, so running tasks are not interrupted.',
       restartRemote: 'Restart remote',
+      reconnect: 'Reconnect',
       restarting: 'Restarting…',
       restartHint: 'Stop the remote dsh process and start it again (interrupts running tasks).',
       stopRemote: 'Stop remote',
@@ -1598,6 +1600,9 @@ window.__ModuleLoader__.load({
                 if (connection && connection.status === 'error') {
                   setPhase('error')
                   setError(connection.error || t('hostConnectFailed'))
+                  // 主机侧会对瞬时故障（本机刚唤醒、网络抖动、SSH 步骤超时）自动退避重试：
+                  // 继续轮询，一旦重新连上就自动切回远端视图，而不是一直停在错误页。
+                  timer = setTimeout(poll, 2500)
                   return
                 }
                 if (!connectRequested.current) {
@@ -1673,6 +1678,18 @@ window.__ModuleLoader__.load({
 
           const cancelStop = () => setConfirmStop(false)
 
+          /** 手动重试连接：让 Host 对已有记录重建一次连接尝试（不会重启远端 dsh）。 */
+          const reconnect = () => {
+            setError('')
+            setPhase('connecting')
+            connectRequested.current = true
+            postJson('/connect', { id: hostId })
+              .catch((cause) => {
+                setPhase('error')
+                setError(String((cause && cause.message) || cause))
+              })
+          }
+
           /**
            * 确认停止远端：Host 结束远端 dsh 并断开隧道。
            * 这是唯一会主动结束远端进程的操作；成功后回到本地界面。
@@ -1735,6 +1752,11 @@ window.__ModuleLoader__.load({
                       'div',
                       { className: 'rd-remoteStatusActions' },
                       h('button', { type: 'button', className: 'rd-btn rd-btnSmall', onClick: backToLocal }, t('back')),
+                      h(
+                        'button',
+                        { type: 'button', className: 'rd-btn rd-btnSmall rd-btnPrimary', onClick: reconnect },
+                        t('reconnect'),
+                      ),
                       h(
                         'button',
                         {

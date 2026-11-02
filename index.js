@@ -918,6 +918,7 @@ async function prepareDetachedRemoteDsh(conn, sshPath, runStep = runRemoteStep, 
       conn,
       `SSH 执行远端 dsh 准备命令失败，无法确认远端状态；不会自动清理远端进程。\n${remoteStepFailureDetail(step)}`,
       '[setup] SSH 远端准备命令失败',
+      { retryable: true },
     )
     return false
   }
@@ -967,7 +968,10 @@ async function prepareDetachedRemoteDsh(conn, sshPath, runStep = runRemoteStep, 
           : `远端准备命令未返回有效状态或访问令牌；无法确认远端 dsh 状态。\n${remoteStepFailureDetail(step)}`
   // 只有脚本明确返回本次新起的 PID 才清理；SSH 失败/未知输出不能证明启动过进程。
   if (result.started && result.failed === 'no-token' && !result.reuse) cleanupRemote(conn.host, port)
-  failConnection(conn, `启动远端 dsh 失败：${reason}`, `[setup] 后台启动失败（${code}）`)
+  // 未知状态多来自唤醒瞬间的网络/超时，标记为可重试；确定性失败（端口占用等）不重试。
+  failConnection(conn, `启动远端 dsh 失败：${reason}`, `[setup] 后台启动失败（${code}）`, {
+    retryable: code === 'unknown',
+  })
   return false
 }
 
@@ -1048,6 +1052,7 @@ async function ensureRemoteDsh(conn, sshPath, runStep = runRemoteStep) {
       conn,
       `SSH 探测远端 dsh 失败，无法确认是否已安装 dsh；已停止自动安装。\n${remoteStepFailureDetail(check)}`,
       '[setup] SSH 探测 dsh 失败，未执行自动安装',
+      { retryable: true },
     )
     return false
   }
@@ -1209,6 +1214,9 @@ function createConnection(host) {
     attemptPromise: null,
     // 用户主动断开/重启时置位，避免自动重连把它拉回来。
     userStopped: false,
+    // 本次失败是否属于「可重试」的瞬时故障（本机刚唤醒、网络抖动、SSH 步骤超时）。
+    // 自动重连只对这类失败继续退避重试，不会对端口占用等确定性错误死循环。
+    retryableFailure: false,
   }
 }
 
@@ -1292,6 +1300,7 @@ function markConnected(conn) {
   flushLineBuffer(conn)
   conn.status = 'connected'
   conn.error = null
+  conn.retryableFailure = false
   conn.reconnectAttempt = 0
   conn.url = buildConnectionUrl(conn.localPort, conn.token)
   appendLogLine(
@@ -1300,11 +1309,15 @@ function markConnected(conn) {
   )
 }
 
-/** 置为 error 并清理进程；已经断开/就绪时忽略迟到的失败回调。 */
-function failConnection(conn, message, logMessage = null) {
+/**
+ * 置为 error 并清理进程；已经断开/就绪时忽略迟到的失败回调。
+ * options.retryable 标记瞬时故障：自动重连会对这类错误继续按退避重试。
+ */
+function failConnection(conn, message, logMessage = null, options = {}) {
   if (conn.status !== 'connecting') return
   clearConnectionTimers(conn)
   terminateChild(conn)
+  conn.retryableFailure = options.retryable === true
   conn.status = 'error'
   conn.error = message
   conn.url = null
@@ -1338,7 +1351,17 @@ function startAttempt(conn, options = {}) {
   appendLogLine(conn, `[connect] 第 ${attempt} 次连接尝试（${reason}）`)
   const promise = beginSshConnection(conn, { ...options, attempt })
     .catch((error) => {
-      if (conn.attempt === attempt) failConnection(conn, `建立 SSH 连接失败：${toMessage(error)}`)
+      if (conn.attempt === attempt) {
+        failConnection(conn, `建立 SSH 连接失败：${toMessage(error)}`, null, { retryable: true })
+      }
+    })
+    .then(() => {
+      // 瞬时故障（本机刚唤醒、网络未恢复、SSH 步骤超时）不应该把面板钉死在 error：
+      // 远端 dsh 仍在运行，继续按退避自动重试；确定性错误（端口占用等）不重试。
+      if (conn.status !== 'error' || conn.retryableFailure !== true || conn.userStopped) return
+      if (scheduleAutoReconnect(conn)) {
+        appendLogLine(conn, '[reconnect] 本次连接未成功，继续自动重试（远端任务不受影响）')
+      }
     })
     .finally(() => {
       if (conn.attempt === attempt) conn.attemptPromise = null
@@ -1402,7 +1425,7 @@ async function beginSshConnection(conn, options = {}) {
     child.stderr?.on('data', (chunk) => handleSshOutput(conn, chunk))
     child.on('error', (error) => {
       if (conn.child === child) conn.child = null
-      failConnection(conn, `无法启动 ssh 进程：${toMessage(error)}`)
+      failConnection(conn, `无法启动 ssh 进程：${toMessage(error)}`, null, { retryable: true })
     })
     child.on('exit', (code, signal) => {
       if (conn.child === child) conn.child = null
@@ -1412,7 +1435,7 @@ async function beginSshConnection(conn, options = {}) {
     conn.deadlineTimer = setTimeout(() => {
       conn.deadlineTimer = null
       if (conn.status !== 'connecting') return
-      failConnection(conn, buildConnectTimeoutMessage(conn), 'SSH 连接超时（45 秒）')
+      failConnection(conn, buildConnectTimeoutMessage(conn), 'SSH 连接超时（45 秒）', { retryable: true })
     }, CONNECT_TIMEOUT_MS)
     if (typeof conn.deadlineTimer.unref === 'function') conn.deadlineTimer.unref()
 
@@ -1464,7 +1487,7 @@ function scheduleAutoReconnect(conn) {
   if (conn.userStopped) return false
   const attempt = typeof conn.reconnectAttempt === 'number' ? conn.reconnectAttempt : 0
   if (attempt >= AUTO_RECONNECT_DELAYS_MS.length) {
-    appendLogLine(conn, '[reconnect] 自动重连次数已用尽，请手动点「重新加载」或「重启远端」')
+    appendLogLine(conn, '[reconnect] 自动重连次数已用尽，请点「重新连接」重试（或「重启远端」）')
     conn.localPort = null
     return false
   }
@@ -1472,7 +1495,7 @@ function scheduleAutoReconnect(conn) {
   const delay = AUTO_RECONNECT_DELAYS_MS[attempt]
   appendLogLine(
     conn,
-    `[reconnect] 隧道已断开，${Math.round(delay / 1000)} 秒后自动重连（远端任务保持运行；第 ${attempt + 1}/${AUTO_RECONNECT_DELAYS_MS.length} 次）`,
+    `[reconnect] ${Math.round(delay / 1000)} 秒后自动重连（远端任务保持运行；第 ${attempt + 1}/${AUTO_RECONNECT_DELAYS_MS.length} 次）`,
   )
   conn.reconnectTimer = setTimeout(() => {
     conn.reconnectTimer = null
@@ -1494,6 +1517,7 @@ function retryConnection(conn) {
   conn.error = null
   conn.url = null
   conn.token = null
+  conn.retryableFailure = false
   startAttempt(conn, { preferredLocalPort: preferred, skipDshCheck: true, reason: 'auto-reconnect' })
 }
 
@@ -2336,6 +2360,7 @@ async function connectHost(rawId) {
     current.error = null
     current.url = null
     current.token = null
+    current.retryableFailure = false
     appendLogLine(current, '[reconnect] 收到手动重连请求')
     startAttempt(current, { preferredLocalPort: current.localPort, reason: 'manual' })
     return { ok: true }

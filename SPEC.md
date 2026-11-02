@@ -752,3 +752,39 @@ Client 半：
   覆盖三态、exit255、stderr 假标记、null/超时/未知/歧义输出、原始错误脱敏、安装后复查、
   未知状态不清理，以及 21.6s 成功/60s 边界。另用本机 node 子进程验证分流、close、
   进程失败与超时，未新增 npm 依赖。
+
+### v0.11.2 — 瞬时失败自动重试 + 错误页可恢复（睡眠唤醒不再卡死）
+
+现象：笔记本睡眠/断网后唤醒，自动重连的第一次尝试里 SSH 步骤超时，界面停在
+「远端界面加载失败：启动远端 dsh 失败…」；但远端 dsh 一直在跑（端口监听、日志有令牌），
+点图标/刷新也无法自动恢复。
+
+根因：
+
+1. v0.11.1 已修正文案与「不误清理」，但**失败后没有任何重试**：自动重连只在
+   「隧道子进程退出」路径上调度；SSH 准备步骤失败（唤醒瞬间网络未恢复、步骤超时）
+   会直接停在 error，直到用户手动操作。
+2. Client 半在 `connection.status === 'error'` 时直接 `return` 不再轮询；即使主机侧
+   之后重连成功，页面也不会自动恢复。错误页只有「重启远端」「停止远端」，缺少
+   「重新连接」这种不重启远端进程的重试入口。
+
+修复（Host）：
+
+- `createConnection` 新增 `conn.retryableFailure`；`failConnection(conn, message, log,
+  { retryable })` 记录本次失败是否属于瞬时故障。
+- 标记为 `retryable` 的失败：SSH 准备/迁移步骤失败（`stepSucceeded`）、`/test` 之外
+  的 dsh 探测失败（`ensureRemoteDsh` 三态中的 failed）、`beginSshConnection` 抛错、
+  隧道子进程 spawn 错误、45s 就绪超时、`prepareDetachedRemoteDsh` 的 `unknown` 状态。
+  确定性失败（端口占用、`no-token` 且确有本次新进程、安装命令失败、缺 ssh）不重试。
+- `startAttempt` 在尝试结束后：若 `status==='error' && retryableFailure && !userStopped`，
+  调 `scheduleAutoReconnect` 继续按 1.5/3/5/8/13/21 秒退避重试（最多 6 次），并记录
+  `[reconnect] 本次连接未成功，继续自动重试`。次数用尽才停在 error。
+- `markConnected` / `retryConnection` / 手动 `POST /connect` 都会重置 `retryableFailure`；
+  `[reconnect]` 日志文案从「隧道已断开」改为通用说法，次数用尽提示「重新连接」。
+
+修复（Client）：
+
+- error 状态下继续每 2.5s 轮询 `/state`：主机自动重试成功后面板自动切回远端视图。
+- 错误页新增「重新连接」按钮（`POST /connect`，复用连接记录，不会重启远端 dsh）。
+- 新增 i18n key `reconnect`（中英同步）。新增 `host-smoke` 断言：ConnectionView 不变，
+  以上均为内部状态；纯函数/回归测试保持全绿。
